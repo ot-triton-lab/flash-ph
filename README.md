@@ -1,9 +1,5 @@
 # flash-ph
 
-[![PyPI](https://img.shields.io/pypi/v/flash-ph)](https://pypi.org/project/flash-ph/)
-[![Python](https://img.shields.io/pypi/pyversions/flash-ph)](https://pypi.org/project/flash-ph/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-
 **GPU-accelerated exact Rips persistent homology**
 
 flash-ph computes exact Vietoris-Rips persistent homology (H0, H1, H2) over Z/2Z using PyTorch + Triton kernels on NVIDIA GPUs. The public API includes `rips_persistence`, `auto_threshold`, `enclosing_radius`, and a GUDHI-compatible `RipsComplex` class.
@@ -15,8 +11,23 @@ flash-ph computes exact Vietoris-Rips persistent homology (H0, H1, H2) over Z/2Z
 pip install -e ".[dev]"
 ```
 
-**Requirements:** Python >= 3.10, PyTorch >= 2.5 with CUDA, Numba.
-**Dev extras:** pytest, ripser, giotto-ph.
+**Requirements:**
+
+| Package | Version | Notes |
+|---------|---------|-------|
+| Python | >= 3.10 | Tested on 3.11 |
+| PyTorch | >= 2.5 | With CUDA (tested: 2.10.0+cu128) |
+| Triton | >= 3.0 | Auto-installed with PyTorch (tested: 3.6.0) |
+| Numba | >= 0.60 | CPU fallback for cohomology reduction (tested: 0.63.1) |
+| NumPy | >= 1.24 | Tested: 2.3.5 |
+
+**Dev extras (for testing and benchmarks):**
+
+| Package | Notes |
+|---------|-------|
+| pytest | Test runner |
+| ripser | CPU reference for parity checks |
+| giotto-ph | CPU baseline for benchmarks |
 
 ## Quick Start
 
