@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "flash-ph"
+dynamic = ["version"]
+description = "GPU-accelerated exact Rips persistent homology"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+keywords = ["persistent-homology", "topological-data-analysis", "triton", "pytorch", "gpu"]
+authors = [
+  {name = "flash-ph contributors"}
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering",
+  "Environment :: GPU :: NVIDIA CUDA",
+]
+dependencies = [
+  "numpy",
+  "torch>=2.5",
+  "numba",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "ripser",
+  "giotto-ph",
+]
+
+[tool.hatch.version]
+source = "regex"
+path = "src/flash_ph/__init__.py"
+pattern = '__version__\s*=\s*"(?P<version>[^"]+)"'
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/flash_ph"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["src/flash_ph/testing"]
