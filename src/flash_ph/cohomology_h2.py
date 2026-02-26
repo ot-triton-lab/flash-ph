@@ -76,7 +76,10 @@ def _general_cohomology_reduce(
     hm_vals = np.full(hm_cap, np.int64(-1))
 
     # Pool allocator (single array per entry)
-    pool_cap = min(max(K * 16, 100000), MAX_POOL_ENTRIES)
+    # Size based on actual total cofacet entries (not K*16 which underestimates
+    # when cofacet lists are long, e.g. H2 with ~40 cofacets per triangle)
+    total_cofacets = np.int64(cofacet_offsets[K])
+    pool_cap = min(max(total_cofacets * 2, K * 16, 100000), MAX_POOL_ENTRIES)
     pool_data = np.empty(pool_cap, dtype=np.int32)
     piv_start = np.empty(K, dtype=np.int64)
     piv_length = np.empty(K, dtype=np.int32)
@@ -184,7 +187,11 @@ def _general_cohomology_reduce(
                 pair_births[n_pairs] = r_e
                 pair_deaths[n_pairs] = piv_rank
                 n_pairs += 1
-        # else: column zeroed -> cocycle in image, not essential
+        else:
+            # Column reduced to zero via XOR: σ is a cocycle not in the
+            # coboundary image → essential birth (infinite bar).
+            ess_births[n_ess] = r_e
+            n_ess += 1
 
     return pair_births[:n_pairs], pair_deaths[:n_pairs], ess_births[:n_ess], all_pivots[:n_all_piv]
 
@@ -319,6 +326,10 @@ def _general_cohomology_reduce_v2(
                 pair_births[n_pairs] = r_e
                 pair_deaths[n_pairs] = piv_rank
                 n_pairs += 1
+        else:
+            # Column reduced to zero via XOR: essential birth (infinite bar).
+            ess_births[n_ess] = r_e
+            n_ess += 1
 
     return pair_births[:n_pairs], pair_deaths[:n_pairs], ess_births[:n_ess], all_pivots[:n_all_piv]
 
@@ -532,8 +543,10 @@ def _general_cohomology_reduce_gpu_prepass(
     hm_keys = np.full(hm_cap, np.int64(-1))
     hm_vals = np.full(hm_cap, np.int64(-1))
 
-    # Pool sizing (for apparent + residual)
-    pool_cap = min(max(K * 16, 100000), MAX_POOL_ENTRIES)
+    # Pool sizing: must fit all apparent pair cofacets + headroom for residual
+    # reductions. K*16 underestimates when columns have ~40+ cofacets (H2).
+    total_cofacets = int(off_np[K]) if K > 0 else 0
+    pool_cap = min(max(total_cofacets * 2, K * 16, 100000), MAX_POOL_ENTRIES)
     pool_data = np.empty(pool_cap, dtype=np.int32)
     piv_start = np.empty(K, dtype=np.int64)
     piv_length = np.empty(K, dtype=np.int32)
@@ -613,7 +626,8 @@ def general_cohomology_reduce(
         hm_cap = p
         hm_keys = np.full(hm_cap, np.int64(-1))
         hm_vals = np.full(hm_cap, np.int64(-1))
-        pool_cap = min(max(K * 16, 100000), MAX_POOL_ENTRIES)
+        total_cofacets = int(off_np[K]) if K > 0 else 0
+        pool_cap = min(max(total_cofacets * 2, K * 16, 100000), MAX_POOL_ENTRIES)
         pool_data = np.empty(pool_cap, dtype=np.int32)
         piv_start = np.empty(K, dtype=np.int64)
         piv_length = np.empty(K, dtype=np.int32)

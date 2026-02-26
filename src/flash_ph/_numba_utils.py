@@ -8,7 +8,7 @@ from __future__ import annotations
 import numpy as np
 from numba import njit
 
-MAX_COL = 262144  # Maximum column length for working buffers (256K)
+MAX_COL = 1048576  # Maximum column length for working buffers (1M)
 MAX_POOL_ENTRIES = 100_000_000  # Cap pool at 100M entries (~1.2GB)
 
 
