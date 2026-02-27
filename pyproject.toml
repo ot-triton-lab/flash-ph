@@ -26,6 +26,7 @@ dependencies = [
   "numpy",
   "torch>=2.5",
   "numba",
+  "giotto-ph",
 ]
 
 [project.optional-dependencies]
