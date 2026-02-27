@@ -19,7 +19,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 from torch import Tensor
-from numba import njit
+from numba import njit, prange
 
 from flash_ph.rips import rips_filtration
 from flash_ph.boruvka import gpu_boruvka_mst
@@ -319,6 +319,143 @@ def _enumerate_tet_cofacets_sorted(
 
 
 @njit(cache=True)
+def _csr_rank_lookup(src, tgt, adj_ptr, adj_idx, adj_rank):
+    """Binary search for edge rank of (src, tgt) in CSR adjacency."""
+    lo = adj_ptr[src]
+    hi = adj_ptr[src + 1]
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if adj_idx[mid] < tgt:
+            lo = mid + 1
+        elif adj_idx[mid] > tgt:
+            hi = mid
+        else:
+            return adj_rank[mid]
+    return np.int32(-1)
+
+
+@njit(parallel=True, cache=True)
+def _h2_apparent_pair_prepass(
+    tri_v0, tri_v1, tri_v2, tri_max_rank,
+    adj_ptr, adj_idx, adj_rank,
+    T,
+):
+    """Parallel apparent pair detection for H2 (Numba prange).
+
+    For each triangle, finds its youngest tet cofacet via triple CSR
+    intersection and checks the apparent pair condition:
+      max_edge_rank == tri_max_rank AND d < s
+    where s is the triangle vertex NOT on the max edge.
+
+    This is the full Ripser-style check:
+      max edge = (b,c) -> need d < a
+      max edge = (a,c) -> need d < b
+      max edge = (a,b) -> need d < c
+
+    Returns
+    -------
+    is_apparent : (T,) bool
+    apparent_pivot_colex : (T,) int64 -- youngest cofacet colex (valid where is_apparent)
+    """
+    is_apparent = np.zeros(T, dtype=np.bool_)
+    apparent_pivot_colex = np.zeros(T, dtype=np.int64)
+
+    for i in prange(T):
+        a = tri_v0[i]
+        b = tri_v1[i]
+        c = tri_v2[i]
+        r_t = tri_max_rank[i]
+
+        a_start, a_end = adj_ptr[a], adj_ptr[a + 1]
+        b_start, b_end = adj_ptr[b], adj_ptr[b + 1]
+        c_start, c_end = adj_ptr[c], adj_ptr[c + 1]
+        ia, ib, ic = a_start, b_start, c_start
+
+        # Track youngest cofacet: (best_rank, best_colex, best_d)
+        best_rank = np.int32(2147483647)  # INT32_MAX
+        best_colex = np.int64(9223372036854775807)  # INT64_MAX
+        best_d = np.int32(-1)
+
+        while ia < a_end and ib < b_end and ic < c_end:
+            na = adj_idx[ia]
+            nb = adj_idx[ib]
+            nc = adj_idx[ic]
+            max_v = na
+            if nb > max_v:
+                max_v = nb
+            if nc > max_v:
+                max_v = nc
+            if na == nb == nc:
+                d = na
+                r_ad = adj_rank[ia]
+                r_bd = adj_rank[ib]
+                r_cd = adj_rank[ic]
+                max_r = r_t
+                if r_ad > max_r:
+                    max_r = r_ad
+                if r_bd > max_r:
+                    max_r = r_bd
+                if r_cd > max_r:
+                    max_r = r_cd
+                # Sort vertices for colex
+                if d < a:
+                    v0, v1, v2, v3 = d, a, b, c
+                elif d < b:
+                    v0, v1, v2, v3 = a, d, b, c
+                elif d < c:
+                    v0, v1, v2, v3 = a, b, d, c
+                else:
+                    v0, v1, v2, v3 = a, b, c, d
+                colex = _tet_colex_numba(v0, v1, v2, v3)
+                # Update best (youngest = smallest rank, then smallest colex)
+                if max_r < best_rank or (max_r == best_rank and colex < best_colex):
+                    best_rank = max_r
+                    best_colex = colex
+                    best_d = d
+                ia += 1
+                ib += 1
+                ic += 1
+            else:
+                if na < max_v:
+                    ia += 1
+                if nb < max_v:
+                    ib += 1
+                if nc < max_v:
+                    ic += 1
+
+        # Apparent pair: youngest cofacet has zero persistence AND triangle
+        # is the oldest face. d < s where s = vertex NOT on the max edge.
+        if best_d >= 0 and best_rank == r_t:
+            d = best_d
+            if d < a:
+                # d < a <= b <= c -> always oldest face regardless of max edge
+                is_apparent[i] = True
+                apparent_pivot_colex[i] = best_colex
+            elif d < c:
+                # Need to identify the max edge to determine s
+                # Look up edge ranks of the triangle via CSR
+                r_bc = _csr_rank_lookup(b, c, adj_ptr, adj_idx, adj_rank)
+                if r_bc == r_t:
+                    # max edge = (b,c), s = a -> need d < a (already failed)
+                    pass
+                else:
+                    r_ac = _csr_rank_lookup(a, c, adj_ptr, adj_idx, adj_rank)
+                    if r_ac == r_t:
+                        # max edge = (a,c), s = b -> need d < b
+                        if d < b:
+                            is_apparent[i] = True
+                            apparent_pivot_colex[i] = best_colex
+                    else:
+                        # max edge = (a,b), s = c -> need d < c
+                        if d < c:
+                            is_apparent[i] = True
+                            apparent_pivot_colex[i] = best_colex
+            # d >= c -> never apparent (no face has s > c)
+
+    return is_apparent, apparent_pivot_colex
+
+
+@njit(cache=True)
 def _cohomology_reduce_h2_lazy(
     tri_v0,            # (T,) int32
     tri_v1,            # (T,) int32
@@ -326,19 +463,19 @@ def _cohomology_reduce_h2_lazy(
     tri_max_rank,      # (T,) int32
     order,             # (T,) int32 — processing order (descending rank)
     skip_mask,         # (T,) bool
+    is_apparent,       # (T,) bool -- from parallel prepass
+    apparent_pivot_colex,  # (T,) int64 -- from parallel prepass
     adj_ptr,           # (n+1,) int32
     adj_idx,           # (2E,) int32
     adj_rank,          # (2E,) int32
     max_degree,        # int
 ):
-    """Lazy H2 cohomology reduction: tet cofacets computed on-the-fly.
+    """Lazy H2 cohomology reduction with pre-computed apparent pairs.
 
-    Same pattern as H1 lazy reduction but one dimension up:
-    - Columns = triangles, rows = tetrahedra (cofacets)
-    - Cofacets via triple CSR intersection (N(a) ∩ N(b) ∩ N(c), all d)
-    - Apparent pair: youngest cofacet max_rank == r_t AND d < a
-      (d < a ensures triangle (a,b,c) is the oldest face of the tet)
-    - Lazy hash map entries for apparent pairs (materialized on XOR hit)
+    Apparent pairs are detected in parallel by _h2_apparent_pair_prepass.
+    This function:
+    1. Pre-populates hash map with apparent pair lazy entries
+    2. Runs sequential reduction ONLY on non-apparent columns (~1% of T)
 
     Returns
     -------
@@ -367,6 +504,13 @@ def _cohomology_reduce_h2_lazy(
     hm_keys = np.full(hm_cap, np.int64(-1))
     hm_vals = np.full(hm_cap, np.int64(-1))
 
+    # --- Phase 1: pre-populate hash map with apparent pairs ---
+    for i in range(T):
+        if is_apparent[i] and not skip_mask[i]:
+            _hm_set(hm_keys, hm_vals, hm_cap,
+                     apparent_pivot_colex[i],
+                     np.int64(-(np.int64(i) + 2)))
+
     # Pool allocator for stored columns: parallel arrays of (rank, colex)
     pool_cap = min(max(T * max(max_degree, 16), 100000), MAX_POOL_ENTRIES)
     pool_rank = np.empty(pool_cap, dtype=np.int32)
@@ -383,15 +527,14 @@ def _cohomology_reduce_h2_lazy(
     buf_b_colex = np.empty(MAX_COL, dtype=np.int64)
     lazy_rank_buf = np.empty(MAX_COL, dtype=np.int32)
     lazy_colex_buf = np.empty(MAX_COL, dtype=np.int64)
-    # Buffers for 4th-vertex tracking (used only for apparent pair check)
-    cofacet_d_buf = np.empty(MAX_COL, dtype=np.int32)
     lazy_d_buf = np.empty(MAX_COL, dtype=np.int32)
+    cofacet_d_buf = np.empty(MAX_COL, dtype=np.int32)
     use_a = True
 
-    # Process triangles in REVERSE filtration order (largest rank first)
+    # --- Phase 2: reduce only non-apparent, non-skipped columns ---
     for oi in range(T):
         idx = order[oi]
-        if skip_mask[idx]:
+        if skip_mask[idx] or is_apparent[idx]:
             continue
 
         r_t = tri_max_rank[idx]
@@ -418,16 +561,6 @@ def _cohomology_reduce_h2_lazy(
             # No cofacets -> essential H2 cycle
             ess_births[n_ess] = r_t
             n_ess += 1
-            continue
-
-        # --- Apparent pair check ---
-        # Youngest cofacet must have max_rank == r_t (zero persistence)
-        # AND d < a (triangle (a,b,c) is the oldest face = largest colex face).
-        if cur_rank[0] == r_t and cofacet_d_buf[0] < a:
-            piv_colex = cur_colex[0]
-            # Store as lazy entry: val = -(idx + 2)
-            _hm_set(hm_keys, hm_vals, hm_cap,
-                     piv_colex, np.int64(-(np.int64(idx) + 2)))
             continue
 
         # --- Reduction loop ---
@@ -629,15 +762,33 @@ def _rips_h2_reduction(
     degrees = ptr_cpu[1:] - ptr_cpu[:-1]
     max_deg = int(degrees.max()) if len(degrees) > 0 else 1
 
-    # --- 3. Run lazy H2 cohomology reduction ---
+    # --- 3. GPU apparent pair detection (Triton or Numba fallback) ---
+    if use_gpu:
+        from flash_ph.kernels.apparent_pair_h2_kernel import h2_apparent_pair_scan
+        is_app_t, app_piv_t = h2_apparent_pair_scan(
+            tv0_t, tv1_t, tv2_t, tri_mr_t,
+            filt.vert_adj_ptr, filt.vert_adj_idx, filt.vert_adj_rank,
+            max_deg,
+        )
+        is_apparent = is_app_t.cpu().numpy().astype(np.bool_)
+        apparent_piv = app_piv_t.cpu().numpy()
+    else:
+        is_apparent, apparent_piv = _h2_apparent_pair_prepass(
+            tv0_cpu, tv1_cpu, tv2_cpu, tri_mr_cpu,
+            ptr_cpu, idx_cpu, rank_cpu,
+            T,
+        )
+
+    # --- 4. Run lazy H2 cohomology reduction (residuals only) ---
     pb_ranks, pd_ranks, eb_ranks = _cohomology_reduce_h2_lazy(
         tv0_cpu, tv1_cpu, tv2_cpu, tri_mr_cpu,
         order_cpu, skip_cpu,
+        is_apparent, apparent_piv,
         ptr_cpu, idx_cpu, rank_cpu,
         max_deg,
     )
 
-    # --- 4. Convert edge ranks to distances ---
+    # --- 5. Convert edge ranks to distances ---
     dist_sq_cpu = edge_dist_sq.cpu().numpy()
 
     h2_parts = []
