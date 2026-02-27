@@ -819,6 +819,48 @@ def _rips_h2_reduction(
 
 
 # ---------------------------------------------------------------------------
+# giotto-ph C++ backend (optional)
+# ---------------------------------------------------------------------------
+
+def _rips_h1h2_giotto(filt, n, max_dim, max_edge_length, device):
+    """H1 (+H2) via giotto-ph C++ lockfree reduction engine.
+
+    Builds a COO sparse distance matrix from GPU-computed edges and
+    delegates to ``gph.ripser_parallel``.  Raises ``ImportError`` if
+    giotto-ph is not installed.
+    """
+    from gph import ripser_parallel          # noqa: F811
+    import scipy.sparse
+
+    # COO upper-triangle sparse distance matrix
+    row = filt.edge_i.cpu().numpy().astype(np.int64)
+    col = filt.edge_j.cpu().numpy().astype(np.int64)
+    dist = torch.sqrt(filt.edge_dist_sq).cpu().numpy().astype(np.float32)
+
+    # Zero diagonal (vertex birth = 0)
+    diag = np.arange(n, dtype=np.int64)
+    row = np.concatenate([row, diag])
+    col = np.concatenate([col, diag])
+    dist = np.concatenate([dist, np.zeros(n, dtype=np.float32)])
+
+    dm = scipy.sparse.coo_matrix((dist, (row, col)), shape=(n, n))
+    result = ripser_parallel(
+        dm, maxdim=max_dim, thresh=max_edge_length,
+        metric="precomputed", collapse_edges=True, n_threads=-1,
+    )
+
+    diagrams = []
+    for d in range(1, max_dim + 1):
+        dgm_np = result["dgms"][d]
+        if len(dgm_np) > 0:
+            t = torch.from_numpy(dgm_np).float().to(device)
+        else:
+            t = torch.empty(0, 2, dtype=torch.float32, device=device)
+        diagrams.append(t)
+    return diagrams  # [H1] or [H1, H2]
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -936,7 +978,21 @@ def rips_persistence(
     if max_dim == 0:
         return [h0]
 
-    # Step 3: Cohomology-based H1 reduction
+    # Step 3+4: H1 (+H2) — try giotto-ph C++ backend first
+    try:
+        higher_dims = _rips_h1h2_giotto(
+            filt, n, max_dim, max_edge_length, device,
+        )
+        result = [h0]
+        for diag in higher_dims:
+            if diag.numel() > 0:
+                diag = diag[diag[:, 0].argsort(stable=True)]
+            result.append(diag)
+        return result
+    except ImportError:
+        pass  # Fall through to Numba pipeline
+
+    # --- Numba fallback: H1 reduction ---
     mst_mask = torch.zeros(E, dtype=torch.bool, device=device)
     if mst_idx.numel() > 0:
         mst_mask[mst_idx] = True
