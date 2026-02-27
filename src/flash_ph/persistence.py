@@ -3,20 +3,15 @@
 Pipeline:
 - GPU (CUDA): direct Triton edge enumeration -> Boruvka MST (H0)
 - CPU (Numba): cohomology-based reduction for H1 (host transfer of CSR/edges)
-- CPU: general cohomology reduction for H2 (explicit simplex enumeration +
-  clearing cascade from H1, same reduction algorithm)
+- CPU (Numba): lazy H2 cohomology — triangles materialized, tet cofacets
+  computed on-the-fly via triple CSR intersection (same pattern as H1)
 
-H2 design notes (Ripser-style clearing + general cohomology reducer):
-  Ripser and Ripser++ compute H2 via implicit coboundary on-the-fly, with
-  clearing (H1 death-pivots skip in H2) and apparent-pair detection (~99%
-  of columns are apparent).
-
-  Our approach: explicitly enumerate all triangles and tetrahedra in the
-  Rips complex from CSR adjacency, then feed them into the general
-  cohomology reducer. This gives:
-  - Clearing optimization via skip-mask cascade (H1 pivot triangles skipped)
-  - Apparent pair optimization via cofacet_max_face_rank precomputation
-  - Exact results matching ripser
+H2 design notes (lazy cofacet enumeration):
+  Like Ripser, cofacets are computed implicitly rather than materializing
+  all tetrahedra.  For each triangle (a,b,c), tet cofacets are found by
+  N(a) ∩ N(b) ∩ N(c) with d > c.  Apparent pair check: if the youngest
+  cofacet has max_edge_rank == tri_max_rank, it's zero-persistence.
+  This drops memory from O(T+Q) to O(T).
 """
 from __future__ import annotations
 
@@ -31,6 +26,10 @@ from flash_ph.boruvka import gpu_boruvka_mst
 from flash_ph.cohomology_h1 import (
     cohomology_reduction_h1,
     cohomology_reduction_h1_gpu,
+    _sorted_merge_xor,
+)
+from flash_ph._numba_utils import (
+    _hm_get, _hm_set, MAX_COL, MAX_POOL_ENTRIES,
 )
 
 
@@ -215,255 +214,312 @@ def _enumerate_rips_tetrahedra(
 
 
 # ---------------------------------------------------------------------------
-# H2 reduction helpers
+# Lazy H2 cofacet enumeration (Numba JIT)
 # ---------------------------------------------------------------------------
 
 _VERTEX_PACK_BITS = 16
 
 
-def _rips_h2_build_csr_gpu(
-    tri_verts: Tensor,
-    tet_verts: Tensor,
-    tri_mr: Tensor,
-    tet_mr: Tensor,
-    edge_dist: Tensor,
-    h1_pivot_colex_sorted: Tensor,
-    keep_device: bool = False,
-):
-    """Build H2 reduction inputs directly on GPU.
+@njit(cache=True)
+def _tet_colex_numba(a, b, c, d):
+    """Colexicographic index for tetrahedron (a, b, c, d) with a < b < c < d.
 
-    Specialized for Rips H2: only builds dim 2->3 cofacet CSR,
-    uses restricted global ranking (triangles + tetrahedra only),
-    and computes skip-mask via pre-sorted H1 pivots.
-
-    Returns (col_ranks, cofacet_offsets, cofacet_ranks, skip_mask,
-             rank_to_filt, cofacet_max_face_rank) all on CPU ready
-    for Numba reduction (unless keep_device=True).
+    Computes C(d,4) + C(c,3) + C(b,2) + a with overflow-safe early division.
     """
-    from flash_ph.cohomology_h2 import _simplex_colex_id
-    from flash_ph._simplex_utils import _pack_simplex_keys
-
-    dev = tri_verts.device
-    T = tri_verts.shape[0]
-    Q = tet_verts.shape[0]
-
-    # Guard: 16-bit vertex packing requires n < 65536
-    max_vert = int(tri_verts.max().item()) if T > 0 else 0
-    if Q > 0:
-        max_vert = max(max_vert, int(tet_verts.max().item()))
-    if max_vert >= (1 << _VERTEX_PACK_BITS):
-        raise ValueError(
-            f"Vertex index {max_vert} exceeds {_VERTEX_PACK_BITS}-bit "
-            f"packing limit ({1 << _VERTEX_PACK_BITS}). Reduce n or "
-            f"max_edge_length."
-        )
-
-    # --- 1. Restricted global ranking (T+Q only, not n+E+T+Q) ---
-    # Sort key: (max_edge_rank, dim, colex) via three-pass stable sort.
-    tri_mr_long = tri_mr.long()
-    tet_mr_long = tet_mr.long() if Q > 0 else torch.empty(0, dtype=torch.int64, device=dev)
-    all_mr = torch.cat([tri_mr_long, tet_mr_long])  # (T+Q,)
-    all_dim = torch.cat([
-        torch.full((T,), 2, dtype=torch.int64, device=dev),
-        torch.full((Q,), 3, dtype=torch.int64, device=dev),
-    ])  # (T+Q,)
-
-    # Compute colex IDs for tiebreaking
-    tri_sorted = tri_verts.long()
-    a, b, c = tri_sorted[:, 0], tri_sorted[:, 1], tri_sorted[:, 2]
-    tri_colex = c * (c - 1) * (c - 2) // 6 + b * (b - 1) // 2 + a
-    if Q > 0:
-        tet_sorted = tet_verts.long()
-        va, vb, vc, vd = tet_sorted[:, 0], tet_sorted[:, 1], tet_sorted[:, 2], tet_sorted[:, 3]
-        # Overflow-safe C(vd,4): divide early
-        c4_hi = vd * (vd - 1) // 2
-        c4_lo = (vd - 2) * (vd - 3) // 2
-        tet_colex = (c4_hi * c4_lo // 6
-                     + vc * (vc - 1) * (vc - 2) // 6
-                     + vb * (vb - 1) // 2 + va)
-    else:
-        tet_colex = torch.empty(0, dtype=torch.int64, device=dev)
-    all_colex = torch.cat([tri_colex, tet_colex])
-
-    # Three-pass stable sort (reverse priority): colex, dim, max_edge_rank
-    perm = torch.argsort(all_colex, stable=True)
-    perm = perm[torch.argsort(all_dim[perm], stable=True)]
-    perm = perm[torch.argsort(all_mr[perm], stable=True)]
-
-    total = T + Q
-    rank_flat = torch.empty(total, dtype=torch.int32, device=dev)
-    rank_flat[perm] = torch.arange(total, dtype=torch.int32, device=dev)
-    tri_ranks = rank_flat[:T]      # (T,) global ranks of triangles
-    tet_ranks = rank_flat[T:]      # (Q,) global ranks of tetrahedra
-
-    # rank_to_filt: map restricted global rank -> filtration distance
-    rank_to_filt = edge_dist[all_mr[perm]].cpu().float()  # (T+Q,)
-
-    # --- 2. Direct dim 2->3 cofacet CSR on GPU ---
-    tri_sorted_verts = tri_verts.long()
-    tri_keys = _pack_simplex_keys(tri_sorted_verts)  # (T,)
-    tri_key_perm = tri_keys.argsort()
-    tri_keys_sorted = tri_keys[tri_key_perm]
-
-    if Q > 0:
-        tet_sorted_verts = tet_verts.long()
-        all_face_idx = []
-        all_cofacet_idx = []
-
-        for drop in range(4):
-            face = torch.cat([
-                tet_sorted_verts[:, :drop],
-                tet_sorted_verts[:, drop + 1:],
-            ], dim=1)  # (Q, 3)
-            query = _pack_simplex_keys(face)
-            pos = torch.searchsorted(tri_keys_sorted, query)
-            pos = pos.clamp(max=max(T - 1, 0))
-            matched = tri_keys_sorted[pos] == query
-            midx = matched.nonzero(as_tuple=True)[0]
-            if midx.numel() > 0:
-                all_face_idx.append(tri_key_perm[pos[midx]])
-                all_cofacet_idx.append(midx)
-
-        n_matched = sum(fi.numel() for fi in all_face_idx) if all_face_idx else 0
-        if n_matched != 4 * Q:
-            raise RuntimeError(
-                f"Face matching failed: expected {4 * Q} matches "
-                f"(4 faces × {Q} tets), got {n_matched}. "
-                f"Possible key collision or enumeration bug."
-            )
-
-        if all_face_idx:
-            all_fi = torch.cat(all_face_idx)
-            all_ci = torch.cat(all_cofacet_idx)
-
-            cofacet_global = tet_ranks[all_ci.long()]
-
-            sort_perm = all_fi.argsort(stable=True)
-            sorted_fi = all_fi[sort_perm]
-            sorted_cof = cofacet_global[sort_perm]
-
-            counts = torch.zeros(T, dtype=torch.int64, device=dev)
-            counts.scatter_add_(
-                0, sorted_fi.long(),
-                torch.ones_like(sorted_fi, dtype=torch.int64),
-            )
-            offsets = torch.zeros(T + 1, dtype=torch.int32, device=dev)
-            offsets[1:] = counts.cumsum(0).to(torch.int32)
-
-            shift = (total - 1).bit_length() + 1
-            seg_key = sorted_fi.long() << shift | sorted_cof.long()
-            seg_perm = seg_key.argsort(stable=True)
-            cofacet_ranks_sorted = sorted_cof[seg_perm]
-        else:
-            offsets = torch.zeros(T + 1, dtype=torch.int32, device=dev)
-            cofacet_ranks_sorted = torch.empty(
-                0, dtype=torch.int32, device=dev,
-            )
-    else:
-        offsets = torch.zeros(T + 1, dtype=torch.int32, device=dev)
-        cofacet_ranks_sorted = torch.empty(0, dtype=torch.int32, device=dev)
-
-    # --- 3. Skip mask (H1 clearing) ---
-    skip_mask = torch.zeros(T, dtype=torch.bool, device=dev)
-    if h1_pivot_colex_sorted.numel() > 0:
-        tri_colex = _simplex_colex_id(tri_sorted_verts.int(), dim=2)
-        h1_sorted = h1_pivot_colex_sorted.to(dev)
-        pos = torch.searchsorted(h1_sorted, tri_colex)
-        pos = pos.clamp(max=max(h1_sorted.numel() - 1, 0))
-        skip_mask = h1_sorted[pos] == tri_colex
-
-    # --- 4. Compute cofacet_max_face_rank on GPU ---
-    n_cof = cofacet_ranks_sorted.shape[0]
-    cofacet_max_face_rank = torch.full(
-        (total,), -1, dtype=torch.int32, device=dev,
-    )
-    if n_cof > 0:
-        entry_idx = torch.arange(n_cof, device=dev)
-        parent_face = torch.searchsorted(
-            offsets[1:].long(), entry_idx, right=True,
-        )
-        face_ranks_expanded = tri_ranks[parent_face].clone()
-        face_ranks_expanded[skip_mask[parent_face]] = -1
-        cofacet_max_face_rank.scatter_reduce_(
-            0, cofacet_ranks_sorted.long(),
-            face_ranks_expanded, reduce='amax',
-        )
-
-    if keep_device:
-        return (tri_ranks, offsets, cofacet_ranks_sorted, skip_mask,
-                rank_to_filt, cofacet_max_face_rank)
-    return (
-        tri_ranks.cpu(),
-        offsets.cpu(),
-        cofacet_ranks_sorted.cpu(),
-        skip_mask.cpu(),
-        rank_to_filt,
-        cofacet_max_face_rank.cpu(),
-    )
+    a64, b64, c64, d64 = np.int64(a), np.int64(b), np.int64(c), np.int64(d)
+    # C(d,4) = d*(d-1)/2 * (d-2)*(d-3)/2 / 6  (split to avoid overflow)
+    c4_hi = d64 * (d64 - 1) // 2
+    c4_lo = (d64 - 2) * (d64 - 3) // 2
+    return c4_hi * c4_lo // 6 + c64 * (c64 - 1) * (c64 - 2) // 6 + b64 * (b64 - 1) // 2 + a64
 
 
-def _rips_h2_build_csr_cpu(
-    tv0, tv1, tv2, tri_mr_np,
-    qv0, qv1, qv2, qv3, tet_mr_np,
-    edge_dist: Tensor,
-    h1_pivot_colex_sorted: Tensor,
-    n: int,
-    edge_i: Tensor,
-    edge_j: Tensor,
+@njit(cache=True)
+def _enumerate_tet_cofacets_sorted(
+    tri_v0, tri_v1, tri_v2, tri_max_rank_val,
+    adj_ptr, adj_idx, adj_rank,
+    out_rank, out_colex, out_d,
 ):
-    """CPU fallback: uses generic functions for H2 CSR building."""
-    from flash_ph.cohomology_h2 import (
-        compute_global_ranks, _simplex_colex_id,
-    )
-    from flash_ph._simplex_utils import (
-        _build_cofacet_adjacency,
-        _build_cofacet_csr_for_reduction,
-    )
+    """Enumerate ALL tet cofacets of a triangle via triple CSR intersection.
 
-    E = edge_dist.shape[0]
-    tri_verts = torch.stack([
-        torch.from_numpy(tv0), torch.from_numpy(tv1), torch.from_numpy(tv2),
-    ], dim=1)
-    tet_verts = torch.stack([
-        torch.from_numpy(qv0), torch.from_numpy(qv1),
-        torch.from_numpy(qv2), torch.from_numpy(qv3),
-    ], dim=1)
+    For triangle (a,b,c), finds ALL d in N(a) ∩ N(b) ∩ N(c) (d != a,b,c).
+    Each cofacet tet has max_edge_rank = max(tri_max_rank, r_ad, r_bd, r_cd).
+    Results written to out_rank/out_colex/out_d, sorted by (rank ASC, colex ASC).
 
-    edge_dist_cpu = edge_dist.cpu()
-    tri_filt = edge_dist_cpu[torch.from_numpy(tri_mr_np).long()].float()
-    tet_filt = edge_dist_cpu[torch.from_numpy(tet_mr_np).long()].float()
+    Returns cn: number of cofacets.
+    """
+    a, b, c = tri_v0, tri_v1, tri_v2
+    a_start, a_end = adj_ptr[a], adj_ptr[a + 1]
+    b_start, b_end = adj_ptr[b], adj_ptr[b + 1]
+    c_start, c_end = adj_ptr[c], adj_ptr[c + 1]
+    ia, ib, ic = a_start, b_start, c_start
+    cn = 0
 
-    # Full global ranking (all dims) for generic path
-    vert_verts = torch.arange(n, dtype=torch.int32).unsqueeze(1)
-    vert_filt = torch.zeros(n, dtype=torch.float32)
-    edge_filt = edge_dist_cpu.float()
-    ei = edge_i.cpu().to(torch.int32)
-    ej = edge_j.cpu().to(torch.int32)
-    edge_verts = torch.stack([torch.minimum(ei, ej), torch.maximum(ei, ej)], dim=1)
+    while ia < a_end and ib < b_end and ic < c_end:
+        na = adj_idx[ia]
+        nb = adj_idx[ib]
+        nc = adj_idx[ic]
+        max_v = na
+        if nb > max_v:
+            max_v = nb
+        if nc > max_v:
+            max_v = nc
+        if na == nb == nc:
+            d = na
+            r_ad = adj_rank[ia]
+            r_bd = adj_rank[ib]
+            r_cd = adj_rank[ic]
+            max_r = tri_max_rank_val
+            if r_ad > max_r:
+                max_r = r_ad
+            if r_bd > max_r:
+                max_r = r_bd
+            if r_cd > max_r:
+                max_r = r_cd
+            if cn < MAX_COL:
+                # Sort 4 vertices for correct colex computation
+                if d < a:
+                    v0, v1, v2, v3 = d, a, b, c
+                elif d < b:
+                    v0, v1, v2, v3 = a, d, b, c
+                elif d < c:
+                    v0, v1, v2, v3 = a, b, d, c
+                else:
+                    v0, v1, v2, v3 = a, b, c, d
+                out_rank[cn] = max_r
+                out_colex[cn] = _tet_colex_numba(v0, v1, v2, v3)
+                out_d[cn] = d
+                cn += 1
+            ia += 1
+            ib += 1
+            ic += 1
+        else:
+            if na < max_v:
+                ia += 1
+            if nb < max_v:
+                ib += 1
+            if nc < max_v:
+                ic += 1
 
-    simplices = {0: vert_verts, 1: edge_verts, 2: tri_verts, 3: tet_verts}
-    filtrations = {0: vert_filt, 1: edge_filt, 2: tri_filt, 3: tet_filt}
+    # Insertion sort by (rank ASC, colex ASC) — rearrange d alongside
+    for i in range(1, cn):
+        kr = out_rank[i]
+        kc = out_colex[i]
+        kd = out_d[i]
+        j = i - 1
+        while j >= 0 and (out_rank[j] > kr or (out_rank[j] == kr and out_colex[j] > kc)):
+            out_rank[j + 1] = out_rank[j]
+            out_colex[j + 1] = out_colex[j]
+            out_d[j + 1] = out_d[j]
+            j -= 1
+        out_rank[j + 1] = kr
+        out_colex[j + 1] = kc
+        out_d[j + 1] = kd
 
-    global_rank, rank_to_filt = compute_global_ranks(
-        simplices, filtrations, device=torch.device("cpu"),
-    )
-    cofacet_adj = _build_cofacet_adjacency(simplices, max_dim=2)
-    col_ranks, cofacet_offsets, cofacet_ranks = _build_cofacet_csr_for_reduction(
-        simplices, cofacet_adj, global_rank, target_dim=2,
-    )
+    return cn
 
-    # Skip mask
-    T = tri_verts.shape[0]
-    skip_mask = torch.zeros(T, dtype=torch.bool)
-    if h1_pivot_colex_sorted.numel() > 0:
-        tri_colex = _simplex_colex_id(
-            tri_verts.sort(dim=1).values, dim=2,
+
+@njit(cache=True)
+def _cohomology_reduce_h2_lazy(
+    tri_v0,            # (T,) int32
+    tri_v1,            # (T,) int32
+    tri_v2,            # (T,) int32
+    tri_max_rank,      # (T,) int32
+    order,             # (T,) int32 — processing order (descending rank)
+    skip_mask,         # (T,) bool
+    adj_ptr,           # (n+1,) int32
+    adj_idx,           # (2E,) int32
+    adj_rank,          # (2E,) int32
+    max_degree,        # int
+):
+    """Lazy H2 cohomology reduction: tet cofacets computed on-the-fly.
+
+    Same pattern as H1 lazy reduction but one dimension up:
+    - Columns = triangles, rows = tetrahedra (cofacets)
+    - Cofacets via triple CSR intersection (N(a) ∩ N(b) ∩ N(c), all d)
+    - Apparent pair: youngest cofacet max_rank == r_t AND d < a
+      (d < a ensures triangle (a,b,c) is the oldest face of the tet)
+    - Lazy hash map entries for apparent pairs (materialized on XOR hit)
+
+    Returns
+    -------
+    pair_birth_ranks : (P,) int32 — max-edge-ranks of finite pair births (triangles)
+    pair_death_ranks : (P,) int32 — max-edge-ranks of finite pair deaths (tets)
+    ess_birth_ranks  : (M,) int32 — max-edge-ranks of essential H2 features
+    """
+    T = order.shape[0]
+
+    # Output buffers
+    pair_births = np.empty(T, dtype=np.int32)
+    pair_deaths = np.empty(T, dtype=np.int32)
+    ess_births = np.empty(T, dtype=np.int32)
+    n_pairs = 0
+    n_ess = 0
+
+    # Pivot hash map: tet_colex -> tagged union value
+    #   val >= 0    -> pooled column index
+    #   val == -1   -> empty/missing
+    #   val <= -2   -> lazy: tri_array_idx = -val - 2
+    hm_cap = max(T * 4, 64)
+    p = 1
+    while p < hm_cap:
+        p *= 2
+    hm_cap = p
+    hm_keys = np.full(hm_cap, np.int64(-1))
+    hm_vals = np.full(hm_cap, np.int64(-1))
+
+    # Pool allocator for stored columns: parallel arrays of (rank, colex)
+    pool_cap = min(max(T * max(max_degree, 16), 100000), MAX_POOL_ENTRIES)
+    pool_rank = np.empty(pool_cap, dtype=np.int32)
+    pool_colex = np.empty(pool_cap, dtype=np.int64)
+    piv_start = np.empty(T, dtype=np.int64)
+    piv_length = np.empty(T, dtype=np.int32)
+    pool_ptr = 0
+    num_piv = 0
+
+    # Working buffers (ping-pong)
+    buf_a_rank = np.empty(MAX_COL, dtype=np.int32)
+    buf_a_colex = np.empty(MAX_COL, dtype=np.int64)
+    buf_b_rank = np.empty(MAX_COL, dtype=np.int32)
+    buf_b_colex = np.empty(MAX_COL, dtype=np.int64)
+    lazy_rank_buf = np.empty(MAX_COL, dtype=np.int32)
+    lazy_colex_buf = np.empty(MAX_COL, dtype=np.int64)
+    # Buffers for 4th-vertex tracking (used only for apparent pair check)
+    cofacet_d_buf = np.empty(MAX_COL, dtype=np.int32)
+    lazy_d_buf = np.empty(MAX_COL, dtype=np.int32)
+    use_a = True
+
+    # Process triangles in REVERSE filtration order (largest rank first)
+    for oi in range(T):
+        idx = order[oi]
+        if skip_mask[idx]:
+            continue
+
+        r_t = tri_max_rank[idx]
+        a = tri_v0[idx]
+        b = tri_v1[idx]
+        c = tri_v2[idx]
+
+        # Select current buffer
+        if use_a:
+            cur_rank = buf_a_rank
+            cur_colex = buf_a_colex
+        else:
+            cur_rank = buf_b_rank
+            cur_colex = buf_b_colex
+
+        # Enumerate tet cofacets via triple CSR intersection
+        cn = _enumerate_tet_cofacets_sorted(
+            a, b, c, r_t,
+            adj_ptr, adj_idx, adj_rank,
+            cur_rank, cur_colex, cofacet_d_buf,
         )
-        pos = torch.searchsorted(h1_pivot_colex_sorted, tri_colex)
-        pos = pos.clamp(max=max(h1_pivot_colex_sorted.numel() - 1, 0))
-        skip_mask = h1_pivot_colex_sorted[pos] == tri_colex
 
-    return col_ranks, cofacet_offsets, cofacet_ranks, skip_mask, rank_to_filt, None
+        if cn == 0:
+            # No cofacets -> essential H2 cycle
+            ess_births[n_ess] = r_t
+            n_ess += 1
+            continue
+
+        # --- Apparent pair check ---
+        # Youngest cofacet must have max_rank == r_t (zero persistence)
+        # AND d < a (triangle (a,b,c) is the oldest face = largest colex face).
+        if cur_rank[0] == r_t and cofacet_d_buf[0] < a:
+            piv_colex = cur_colex[0]
+            # Store as lazy entry: val = -(idx + 2)
+            _hm_set(hm_keys, hm_vals, hm_cap,
+                     piv_colex, np.int64(-(np.int64(idx) + 2)))
+            continue
+
+        # --- Reduction loop ---
+        while cn > 0:
+            piv_colex = cur_colex[0]
+            piv_idx = _hm_get(hm_keys, hm_vals, hm_cap, piv_colex)
+            if piv_idx == -1:
+                break  # Pivot is free
+
+            # Select output buffer (opposite of current)
+            if use_a:
+                tmp_rank = buf_b_rank
+                tmp_colex = buf_b_colex
+            else:
+                tmp_rank = buf_a_rank
+                tmp_colex = buf_a_colex
+
+            # Handle lazy pivot: materialize column from CSR
+            if piv_idx <= -2:
+                lazy_tri_idx = np.int32(-piv_idx - 2)
+                lcn = _enumerate_tet_cofacets_sorted(
+                    tri_v0[lazy_tri_idx], tri_v1[lazy_tri_idx],
+                    tri_v2[lazy_tri_idx], tri_max_rank[lazy_tri_idx],
+                    adj_ptr, adj_idx, adj_rank,
+                    lazy_rank_buf, lazy_colex_buf, lazy_d_buf,
+                )
+                if lcn == 0 or lazy_colex_buf[0] != piv_colex:
+                    break  # Invariant violated
+
+                # Memoize in pool
+                if pool_ptr + lcn <= pool_cap and num_piv < T:
+                    _hm_set(hm_keys, hm_vals, hm_cap,
+                            piv_colex, np.int64(num_piv))
+                    piv_start[num_piv] = pool_ptr
+                    piv_length[num_piv] = lcn
+                    for i in range(lcn):
+                        pool_rank[pool_ptr + i] = lazy_rank_buf[i]
+                        pool_colex[pool_ptr + i] = lazy_colex_buf[i]
+                    pool_ptr += lcn
+                    piv_idx = np.int64(num_piv)
+                    num_piv += 1
+                else:
+                    # Pool full: XOR directly without memoizing
+                    cn = _sorted_merge_xor(
+                        cur_rank, cur_colex, cn,
+                        lazy_rank_buf, lazy_colex_buf, lcn,
+                        tmp_rank, tmp_colex,
+                    )
+                    use_a = not use_a
+                    cur_rank = tmp_rank
+                    cur_colex = tmp_colex
+                    continue
+
+            # XOR with stored column
+            ps = piv_start[piv_idx]
+            plen = piv_length[piv_idx]
+            cn = _sorted_merge_xor(
+                cur_rank, cur_colex, cn,
+                pool_rank[ps:ps + plen], pool_colex[ps:ps + plen], plen,
+                tmp_rank, tmp_colex,
+            )
+            use_a = not use_a
+            cur_rank = tmp_rank
+            cur_colex = tmp_colex
+
+        if cn > 0:
+            # New pivot found -> persistence pair
+            piv_colex = cur_colex[0]
+            piv_r = cur_rank[0]
+
+            # Store column in pool
+            if pool_ptr + cn <= pool_cap and num_piv < T:
+                _hm_set(hm_keys, hm_vals, hm_cap, piv_colex, np.int64(num_piv))
+                piv_start[num_piv] = pool_ptr
+                piv_length[num_piv] = cn
+                for i in range(cn):
+                    pool_rank[pool_ptr + i] = cur_rank[i]
+                    pool_colex[pool_ptr + i] = cur_colex[i]
+                pool_ptr += cn
+                num_piv += 1
+
+            # Output pair: birth = r_t (triangle), death = piv_r (tet)
+            if piv_r > r_t:
+                pair_births[n_pairs] = r_t
+                pair_deaths[n_pairs] = piv_r
+                n_pairs += 1
+        else:
+            # Column zeroed -> essential H2 cycle
+            ess_births[n_ess] = r_t
+            n_ess += 1
+
+    return (pair_births[:n_pairs], pair_deaths[:n_pairs], ess_births[:n_ess])
 
 
 def _rips_h2_reduction(
@@ -474,30 +530,26 @@ def _rips_h2_reduction(
     E: int,
     device: torch.device,
 ) -> Tensor:
-    """Compute H2 persistence via general cohomology reduction.
+    """Compute H2 persistence via lazy cohomology reduction.
 
-    GPU path: specialized direct cofacet CSR on GPU (restricted ranking,
-    dim 2->3 only). CPU path: generic functions as fallback.
+    Triangles are materialized (columns); tet cofacets are computed
+    on-the-fly via triple CSR intersection during reduction.
+    Memory: O(T) instead of O(T+Q).
 
-    Accepts edge_dist_sq (squared distances) and computes sqrt lazily
-    only for the T+Q simplex max-edge-ranks H2 actually needs.
+    Accepts edge_dist_sq (squared distances) and computes sqrt lazily.
     """
-    from flash_ph.cohomology_h2 import general_cohomology_reduce
-
-    # Pre-sort H1 pivots once (used by both paths)
+    # Pre-sort H1 pivots once (for skip mask)
     h1_sorted = (
         h1_all_pivot_colex.sort().values
         if h1_all_pivot_colex.numel() > 0
         else h1_all_pivot_colex
     )
 
-    # Enumerate triangles and tetrahedra
+    # --- 1. Enumerate triangles (GPU Triton or Numba CPU) ---
     use_gpu = device.type == "cuda" and torch.cuda.is_available()
 
     if use_gpu:
-        from flash_ph.kernels.triangle_kernel import (
-            triangle_enumerate, tetrahedra_enumerate,
-        )
+        from flash_ph.kernels.triangle_kernel import triangle_enumerate
         tv0_t, tv1_t, tv2_t, tri_mr_t = triangle_enumerate(
             filt.edge_i, filt.edge_j,
             filt.vert_adj_ptr, filt.vert_adj_idx, filt.vert_adj_rank,
@@ -507,94 +559,102 @@ def _rips_h2_reduction(
         if T == 0:
             return torch.empty(0, 2, dtype=torch.float32, device=device)
 
-        qv0_t, qv1_t, qv2_t, qv3_t, tet_mr_t = tetrahedra_enumerate(
-            tv0_t, tv1_t, tv2_t, tri_mr_t,
-            filt.vert_adj_ptr, filt.vert_adj_idx, filt.vert_adj_rank,
-            T,
-        )
+        # Compute tri_colex on GPU for skip mask
+        a = tv0_t.long()
+        b = tv1_t.long()
+        c = tv2_t.long()
+        tri_colex = c * (c - 1) * (c - 2) // 6 + b * (b - 1) // 2 + a
 
-        tri_verts = torch.stack([tv0_t, tv1_t, tv2_t], dim=1)
-        Q = qv0_t.shape[0]
-        if Q > 0:
-            tet_verts = torch.stack(
-                [qv0_t, qv1_t, qv2_t, qv3_t], dim=1,
-            )
-        else:
-            tet_verts = torch.empty(
-                0, 4, dtype=tv0_t.dtype, device=device,
-            )
+        # Skip mask: triangles that are H1 pivots
+        skip_mask = torch.zeros(T, dtype=torch.bool, device=device)
+        if h1_sorted.numel() > 0:
+            h1_dev = h1_sorted.to(device)
+            pos = torch.searchsorted(h1_dev, tri_colex)
+            pos = pos.clamp(max=max(h1_dev.numel() - 1, 0))
+            skip_mask = h1_dev[pos] == tri_colex
 
-        # Lazy sqrt
-        edge_dist = torch.sqrt(edge_dist_sq)
+        # Processing order: descending by (tri_max_rank, tri_colex)
+        # Two-pass stable argsort: colex first (secondary), then max_rank (primary)
+        order = torch.argsort(tri_colex, descending=True, stable=True)
+        order = order[torch.argsort(tri_mr_t[order], descending=True, stable=True)]
 
-        # Specialized GPU path: direct cofacet CSR + GPU scatter-max
-        (col_ranks, cof_offsets, cof_ranks, skip_mask,
-         rank_to_filt, cofacet_max_face_rank) = (
-            _rips_h2_build_csr_gpu(
-                tri_verts, tet_verts, tri_mr_t, tet_mr_t,
-                edge_dist, h1_sorted,
-                keep_device=True,
-            )
-        )
+        # Transfer to CPU for Numba reduction
+        tv0_cpu = tv0_t.cpu().numpy()
+        tv1_cpu = tv1_t.cpu().numpy()
+        tv2_cpu = tv2_t.cpu().numpy()
+        tri_mr_cpu = tri_mr_t.cpu().numpy()
+        skip_cpu = skip_mask.cpu().numpy()
+        order_cpu = order.cpu().numpy().astype(np.int32)
     else:
-        # CPU path: Numba enumeration + generic CSR building
         ei_cpu = filt.edge_i.cpu().numpy()
         ej_cpu = filt.edge_j.cpu().numpy()
         ptr_cpu = filt.vert_adj_ptr.cpu().numpy()
         idx_cpu = filt.vert_adj_idx.cpu().numpy()
         rank_cpu = filt.vert_adj_rank.cpu().numpy()
 
-        tv0, tv1, tv2, tri_mr_np = _enumerate_rips_triangles(
+        tv0_cpu, tv1_cpu, tv2_cpu, tri_mr_cpu = _enumerate_rips_triangles(
             ei_cpu, ej_cpu, ptr_cpu, idx_cpu, rank_cpu, E,
         )
-        T = tv0.shape[0]
+        T = tv0_cpu.shape[0]
         if T == 0:
             return torch.empty(0, 2, dtype=torch.float32, device=device)
 
-        qv0, qv1, qv2, qv3, tet_mr_np = _enumerate_rips_tetrahedra(
-            tv0, tv1, tv2, tri_mr_np, ptr_cpu, idx_cpu, rank_cpu, T,
-        )
+        # Compute tri_colex for skip mask (CPU)
+        a64 = tv0_cpu.astype(np.int64)
+        b64 = tv1_cpu.astype(np.int64)
+        c64 = tv2_cpu.astype(np.int64)
+        tri_colex_np = c64 * (c64 - 1) * (c64 - 2) // 6 + b64 * (b64 - 1) // 2 + a64
+        tri_colex_t = torch.from_numpy(tri_colex_np)
 
-        edge_dist = torch.sqrt(edge_dist_sq)
+        skip_mask_t = torch.zeros(T, dtype=torch.bool)
+        if h1_sorted.numel() > 0:
+            pos = torch.searchsorted(h1_sorted, tri_colex_t)
+            pos = pos.clamp(max=max(h1_sorted.numel() - 1, 0))
+            skip_mask_t = h1_sorted[pos] == tri_colex_t
+        skip_cpu = skip_mask_t.numpy()
 
-        (col_ranks, cof_offsets, cof_ranks, skip_mask,
-         rank_to_filt, _) = (
-            _rips_h2_build_csr_cpu(
-                tv0, tv1, tv2, tri_mr_np,
-                qv0, qv1, qv2, qv3, tet_mr_np,
-                edge_dist, h1_sorted, n,
-                filt.edge_i, filt.edge_j,
-            )
-        )
-        cofacet_max_face_rank = None
+        # Processing order: descending by (tri_max_rank, tri_colex)
+        tri_mr_t = torch.from_numpy(tri_mr_cpu)
+        order_t = torch.argsort(tri_colex_t, descending=True, stable=True)
+        order_t = order_t[torch.argsort(tri_mr_t[order_t], descending=True, stable=True)]
+        order_cpu = order_t.numpy().astype(np.int32)
 
-    # Run general cohomology reduction
-    pb, pd, eb, _ = general_cohomology_reduce(
-        col_ranks, cof_offsets, cof_ranks, skip_mask, rank_to_filt,
-        cofacet_max_face_rank=cofacet_max_face_rank,
+    # --- 2. CSR adjacency (always needed, may already be on CPU) ---
+    if use_gpu:
+        ptr_cpu = filt.vert_adj_ptr.cpu().numpy()
+        idx_cpu = filt.vert_adj_idx.cpu().numpy()
+        rank_cpu = filt.vert_adj_rank.cpu().numpy()
+
+    # Compute max vertex degree for pool sizing
+    degrees = ptr_cpu[1:] - ptr_cpu[:-1]
+    max_deg = int(degrees.max()) if len(degrees) > 0 else 1
+
+    # --- 3. Run lazy H2 cohomology reduction ---
+    pb_ranks, pd_ranks, eb_ranks = _cohomology_reduce_h2_lazy(
+        tv0_cpu, tv1_cpu, tv2_cpu, tri_mr_cpu,
+        order_cpu, skip_cpu,
+        ptr_cpu, idx_cpu, rank_cpu,
+        max_deg,
     )
 
-    # Ensure rank_to_filt and rank indices are on same device
-    rank_to_filt_cpu = rank_to_filt.cpu()
-    pb = pb.cpu()
-    pd = pd.cpu()
-    eb = eb.cpu()
+    # --- 4. Convert edge ranks to distances ---
+    dist_sq_cpu = edge_dist_sq.cpu().numpy()
 
-    # Build H2 diagram
     h2_parts = []
-    if pb.numel() > 0:
-        birth_filt = rank_to_filt_cpu[pb.long()]
-        death_filt = rank_to_filt_cpu[pd.long()]
-        finite_h2 = torch.stack(
-            [birth_filt, death_filt], dim=1,
-        ).float().to(device)
+    if pb_ranks.shape[0] > 0:
+        birth_dist = np.sqrt(dist_sq_cpu[pb_ranks.astype(np.int64)])
+        death_dist = np.sqrt(dist_sq_cpu[pd_ranks.astype(np.int64)])
+        finite_h2 = torch.tensor(
+            np.stack([birth_dist, death_dist], axis=1),
+            dtype=torch.float32, device=device,
+        )
         h2_parts.append(finite_h2)
-    if eb.numel() > 0:
-        ess_filt = rank_to_filt_cpu[eb.long()]
+    if eb_ranks.shape[0] > 0:
+        ess_dist = np.sqrt(dist_sq_cpu[eb_ranks.astype(np.int64)])
         inf_h2 = torch.stack([
-            ess_filt.float().to(device),
+            torch.tensor(ess_dist, dtype=torch.float32, device=device),
             torch.full(
-                (eb.numel(),), float("inf"),
+                (eb_ranks.shape[0],), float("inf"),
                 dtype=torch.float32, device=device,
             ),
         ], dim=1)
