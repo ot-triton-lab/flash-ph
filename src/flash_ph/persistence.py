@@ -1,12 +1,11 @@
 """Public API for Vietoris-Rips persistent homology (H0 + H1 + H2).
 
 Pipeline:
-- GPU (CUDA): direct Triton edge enumeration -> Boruvka MST (H0)
-- GPU edges -> COO sparse distance matrix -> giotto-ph C++ reduction (H1/H2)
-
-The key insight: GPU edge enumeration produces a pre-thresholded sparse COO
-matrix that giotto-ph's edge collapse can reduce very efficiently — faster
-than collapsing from a dense point cloud.
+- GPU (CUDA): block-sparse edge enumeration -> Boruvka MST (H0)
+- H1 only (max_dim=1): GPU-native reduction (Triton apparent pairs +
+  triangle enumeration + Numba residual reduction)
+- H1+H2 (max_dim=2): GPU edges -> COO sparse distance matrix ->
+  giotto-ph C++ reduction (H1/H2)
 """
 from __future__ import annotations
 
@@ -180,7 +179,14 @@ def rips_persistence(
     if max_dim == 0:
         return [h0]
 
-    # Step 3+4: H1 (+H2) via giotto-ph C++ backend
+    # Step 3+4: H1 (+H2)
+    if max_dim == 1 and device.type == 'cuda':
+        # GPU-native H1 reduction (no giotto-ph dependency)
+        from flash_ph.reduce_h1_gpu import rips_h1_gpu_native
+        h1 = rips_h1_gpu_native(filt, n, mst_idx, device)
+        return [h0, h1]
+
+    # max_dim == 2 (or CPU fallback): giotto-ph C++ backend
     higher_dims = _rips_h1h2_giotto(
         filt, n, max_dim, max_edge_length, device,
     )
