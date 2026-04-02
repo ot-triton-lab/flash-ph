@@ -310,27 +310,42 @@ The 98%/2% split (GPU apparent pairs / CPU residual) is the sweet spot: the GPU 
 
 ### Scaling Limits (A100-80GB, H0+H1)
 
-Empirical scaling on Gaussian point clouds with thresholds chosen to keep the Rips graph sparse:
+Empirical scaling on Gaussian point clouds with thresholds chosen to keep the Rips graph sparse. flash-ph targets $d \geq 4$ where Alpha complexes are unavailable.
 
-| n | d | threshold | edges | time | GPU mem |
-|---|---|-----------|-------|------|---------|
-| 10,000 | 3 | 0.20 | 36K | 239ms | 20MB |
-| 50,000 | 3 | 0.10 | 117K | 68ms | 66MB |
-| 100,000 | 3 | 0.08 | 241K | 178ms | 263MB |
-| 500,000 | 3 | 0.04 | 753K | 1.3s | 6.5GB |
-| **1,000,000** | **3** | **0.03** | **1.3M** | **4.0s** | **26GB** |
-| 10,000 | 10 | 1.60 | 26K | 40ms | 17MB |
-| 100,000 | 10 | 1.10 | 82K | 130ms | 266MB |
-| 500,000 | 10 | 0.90 | 297K | 2.0s | 6.5GB |
+**$d = 4$ (Clifford torus regime):**
+
+| n | threshold | edges | time | GPU mem |
+|---|-----------|-------|------|---------|
+| 10,000 | 0.55 | 131K | 301ms | 229MB |
+| 50,000 | 0.35 | 566K | 942ms | 857MB |
+| 200,000 | 0.23 | 1.7M | 3.3s | 2.0GB |
+| 500,000 | 0.15 | 2.0M | 3.0s | 6.5GB |
+| **1,000,000** | **0.11** | **2.3M** | **4.9s** | **26GB** |
+
+**$d = 10$ (high-dimensional sweet spot):**
+
+| n | threshold | edges | time | GPU mem |
+|---|-----------|-------|------|---------|
+| 10,000 | 1.60 | 26K | 19ms | 19MB |
+| 100,000 | 1.10 | 81K | 114ms | 266MB |
+| 500,000 | 0.90 | 298K | 2.0s | 6.5GB |
+
+**$d = 50$ (extreme high-d — distance concentration):**
+
+| n | threshold | edges | time | GPU mem |
+|---|-----------|-------|------|---------|
+| 10,000 | 6.50 | 5K | 37ms | 9MB |
+| 100,000 | 6.10 | 76K | 322ms | 282MB |
+| 200,000 | 6.00 | 176K | 1.7s | 1.1GB |
 
 **Hard constraints**:
 
 1. **H2 vertex limit**: $n < 65{,}536$ (16-bit packing in int64 keys). Does not apply to H0/H1.
-2. **Triangle safety limit**: `max_triangles=10M` by default. Fires when threshold is too large relative to $n$ (e.g., `auto_threshold(k=20)` on $n=10K$ d=3 produces 85M triangles). Configurable via parameter.
-3. **GPU memory**: dominant allocations are edge arrays ($3E$ tensors), CSR adjacency ($O(n+E)$), and triangle arrays ($4T$ tensors). At $n=1M$ d=3, this reaches 26GB.
+2. **Triangle safety limit**: `max_triangles=10M` by default. Fires when threshold is too large relative to $n$ (e.g., `auto_threshold(k=20)` on $n=10K$ $d=4$ can produce 85M triangles). Configurable via parameter.
+3. **GPU memory**: dominant allocations are edge arrays ($3E$ tensors), CSR adjacency ($O(n+E)$), and triangle arrays ($4T$ tensors). At $n=1M$ $d=4$, this reaches 26GB.
 4. **Practical ceiling**: $n \approx 1M$ on A100-80GB with a sparse threshold. In higher dimensions ($d \geq 10$), distances concentrate naturally, so `auto_threshold` keeps the graph sparse even at large $n$.
 
-The ceiling is **not $n$ itself** but the product of $n$ and graph density. At 0.01% density, $n = 1M$ produces only 1.3M edges — easily tractable. At 50% density, even $n = 500$ produces 60K edges and 2.9M triangles — enough to overwhelm the reduction stage.
+The ceiling is **not $n$ itself** but the product of $n$ and graph density. At 0.01% density, $n = 1M$ produces only 2.3M edges — tractable in 5 seconds. At 50% density, even $n = 500$ produces 60K edges and 2.9M triangles — enough to overwhelm the reduction stage.
 
 ## 7. Numerical Considerations
 

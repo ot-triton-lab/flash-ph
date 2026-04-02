@@ -108,18 +108,35 @@ Ripser: CPU, full O(n^2) distance matrix. Giotto-ph: CPU, 8 threads, sparse radi
 
 ### Scaling (H0+H1, A100-80GB)
 
-How large can flash-ph go? The practical limit is GPU memory and threshold choice, not n itself.
+How large can flash-ph go? The practical limit is GPU memory and threshold choice, not n itself. flash-ph targets d >= 4, where Alpha complexes are unavailable and Rips is the standard approach.
 
-| n | d | threshold | edges | time | GPU mem |
-|---|---|-----------|-------|------|---------|
-| 10K | 3 | 0.20 | 36K | 239ms | 20MB |
-| 50K | 3 | 0.10 | 117K | 68ms | 66MB |
-| 100K | 3 | 0.08 | 241K | 178ms | 263MB |
-| 500K | 3 | 0.04 | 753K | 1.3s | 6.5GB |
-| **1M** | **3** | **0.03** | **1.3M** | **4.0s** | **26GB** |
-| 10K | 10 | 1.60 | 26K | 40ms | 17MB |
-| 100K | 10 | 1.10 | 82K | 130ms | 266MB |
-| 500K | 10 | 0.90 | 297K | 2.0s | 6.5GB |
+**d=4 (Clifford torus regime):**
+
+| n | threshold | edges | time | GPU mem |
+|---|-----------|-------|------|---------|
+| 10K | 0.55 | 131K | 301ms | 229MB |
+| 50K | 0.35 | 566K | 942ms | 857MB |
+| 200K | 0.23 | 1.7M | 3.3s | 2.0GB |
+| 500K | 0.15 | 2.0M | 3.0s | 6.5GB |
+| **1M** | **0.11** | **2.3M** | **4.9s** | **26GB** |
+
+**d=10 (high-dimensional sweet spot):**
+
+| n | threshold | edges | time | GPU mem |
+|---|-----------|-------|------|---------|
+| 10K | 1.60 | 26K | 19ms | 19MB |
+| 100K | 1.10 | 81K | 114ms | 266MB |
+| 200K | 1.00 | 132K | 350ms | 1.0GB |
+| 500K | 0.90 | 298K | 2.0s | 6.5GB |
+
+**d=50 (extreme high-d):**
+
+| n | threshold | edges | time | GPU mem |
+|---|-----------|-------|------|---------|
+| 10K | 6.50 | 5K | 37ms | 9MB |
+| 50K | 6.20 | 31K | 134ms | 75MB |
+| 100K | 6.10 | 76K | 322ms | 282MB |
+| 200K | 6.00 | 176K | 1.7s | 1.1GB |
 
 **Hard limits:**
 
@@ -128,9 +145,9 @@ How large can flash-ph go? The practical limit is GPU memory and threshold choic
 | n for H2 | < 65,536 | 16-bit vertex packing in int64 keys |
 | Triangle count | < 10M (default) | `max_triangles` safety limit (configurable) |
 | GPU memory | ~80GB (A100) | Edge + triangle + CSR arrays scale with E and T |
-| Practical H1 | **~1M points** | 4s, 26GB on A100-80GB with sparse threshold |
+| Practical H1 | **~1M points** | 5s, 26GB on A100-80GB (d=4, sparse threshold) |
 
-The bottleneck is the **sparsity-memory tradeoff**: at a given threshold, the number of edges E determines both GPU memory usage and runtime. In high dimensions (d >= 10), distances concentrate and `auto_threshold` naturally produces sparse graphs even at large n.
+The bottleneck is the **sparsity-memory tradeoff**: at a given threshold, the number of edges E determines both GPU memory usage and runtime. In higher dimensions (d >= 10), distances concentrate and `auto_threshold` naturally produces sparse graphs even at large n.
 
 ## Related Work
 
