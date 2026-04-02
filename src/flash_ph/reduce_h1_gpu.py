@@ -432,6 +432,9 @@ def _reduce_full(
 # Orchestrator
 # ---------------------------------------------------------------------------
 
+_VALID_BACKENDS = ('auto', 'gpu', 'giotto')
+
+
 def rips_h1_gpu_native(filt, n, mst_idx, max_edge_length, device, backend='auto'):
     """GPU-native H1 persistence for Rips complexes (with adaptive fallback).
 
@@ -456,6 +459,11 @@ def rips_h1_gpu_native(filt, n, mst_idx, max_edge_length, device, backend='auto'
     -------
     h1_diagram : (K, 2) float32 — H1 persistence diagram
     """
+    if backend not in _VALID_BACKENDS:
+        raise ValueError(
+            f"backend must be one of {_VALID_BACKENDS}, got {backend!r}"
+        )
+
     # Early exit: always use giotto-ph if requested
     if backend == 'giotto':
         return _fallback_giotto_h1(filt, n, max_edge_length, device)

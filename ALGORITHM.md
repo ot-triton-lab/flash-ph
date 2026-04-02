@@ -2,7 +2,7 @@
 
 ## 1. Background: Vietoris-Rips Persistent Homology
 
-Given a point cloud $X = \{x_1, \dots, x_n\} \subset \mathbb{R}^d$ and a threshold $\varepsilon > 0$, the **Vietoris-Rips complex** $\mathrm{VR}(X, \varepsilon)$ is the simplicial complex where a $k$-simplex $[v_0, \dots, v_k]$ is included iff all pairwise distances $d(v_i, v_j) \leq \varepsilon$.
+Given a point cloud $X = \{x_1, \dots, x_n\} \subset \mathbb{R}^d$ and a threshold $\varepsilon > 0$, the **Vietoris-Rips complex** $\mathrm{VR}(X, \varepsilon)$ is the simplicial complex where a $k$-simplex $[v_0, \dots, v_k]$ is included iff all pairwise distances $d(v_i, v_j) < \varepsilon$ (strict inequality — this matches ripser's convention and flash-ph's implementation).
 
 **Persistent homology** tracks how homology groups $H_k$ change as $\varepsilon$ increases from 0 to some maximum threshold. Each topological feature (connected component, loop, void) is born at some $\varepsilon_b$ and dies at $\varepsilon_d$, recorded as a bar $(b, d)$ in the **persistence diagram**.
 
@@ -157,7 +157,7 @@ The intersection $N(i) \cap N(j)$ is computed via merge of sorted adjacency list
 
 **Why Triton, not just PyTorch?** The merge-intersection has data-dependent control flow (pointer advances depend on comparison results). PyTorch has no efficient primitive for this. The Triton kernel expresses it naturally with `tl.where` and masked loads.
 
-### Stage 3b: Triton Apparent Pair Detection
+### Stage 3b: GPU Apparent Pair Pre-Detection
 
 **Problem**: for each edge $e$, determine if it's an apparent pair.
 
@@ -172,17 +172,18 @@ For each cofacet triangle t containing e:
             e is an apparent pair with t
 ```
 
-**Triton implementation**:
-- BLOCK_E=128 edges per program (critical — scalar kernels waste 31/32 threads)
-- For each edge, scan cofacet triangles from the CSR structure
-- Pure masking pattern (no break/continue) — stores pivot witness during loop, computes colex rank after
-- Output: boolean mask of apparent pairs + their death times
+**Implementation**: flash-ph uses vectorized PyTorch operations on the cofacet CSR:
+- `scatter_reduce` (min) over cofacet triangle ranks → find youngest cofacet per edge
+- `searchsorted` on packed face keys → look up whether the edge is the oldest face
+- Vectorized comparison → boolean mask of apparent pairs
 
-**Why BLOCK_E=128?** A scalar Triton kernel (1 edge per program) maps each edge to a full CUDA warp/block, wasting 31 of 32 threads. Vectorizing to 128 edges per program gives 25-88x speedup.
+This resolves ~98% of edges without any column reduction. The remaining ~2% are residual columns.
 
-### Stage 3c: Numba Residual Reduction
+> **Note**: flash-tda (the parent project) implements this as a Triton kernel (`apparent_pair_kernel.py`, BLOCK_E=128). flash-ph uses the PyTorch path which is simpler and achieves similar performance since the scatter/searchsorted operations are already GPU-accelerated.
 
-The ~2% of edges that are not apparent pairs require actual cohomology column reduction. This is done on CPU with Numba:
+### Stage 3c: Adaptive Numba Residual Reduction
+
+The ~2% of edges that are not apparent pairs require actual cohomology column reduction. This is done on CPU with Numba, with an adaptive time-budget fallback to giotto-ph:
 
 ```
 For each non-apparent edge e (in reverse filtration order):
@@ -197,10 +198,23 @@ For each non-apparent edge e (in reverse filtration order):
 
 The XOR operation is implemented via sorted merge (Numba `_sorted_merge_xor`). This is the only serial bottleneck, but it only processes ~2% of columns.
 
-### Stage 4: giotto-ph C++ Reduction (H2 Path)
+**Adaptive time-budget fallback** (`backend='auto'`): the reduction cost per column is topology-dependent and unpredictable — O(3) manifolds in d=9 can have columns that take 6000ms each while sphere data takes 0.25ms/column. Since no static metric predicts this, flash-ph uses time-budget monitoring:
 
-For H2, the apparent pair optimization is less effective (fewer apparent pairs in dimension 2). flash-ph delegates to giotto-ph's C++ engine:
+1. Estimate giotto-ph cost: `E × _GIOTTO_US_PER_EDGE` (calibrated at ~7 μs/edge on A100)
+2. Process residual columns in chunks of 100
+3. Each Numba call gets a time budget equal to the remaining giotto-ph estimate
+4. Within Numba, `time.perf_counter()` is checked every 100 XOR iterations via `objmode`
+5. If the budget is exceeded mid-column, abort and fall back to giotto-ph for the full H1
 
+This catches catastrophically expensive columns that no external post-call check can detect.
+
+### Stage 4: giotto-ph C++ Reduction (H2, and H1 Fallback)
+
+giotto-ph's C++ engine is used in two cases:
+- **H2 (max_dim=2)**: always, since H2 apparent pair optimization is less effective
+- **H1 fallback**: when the adaptive backend (`backend='auto'`) determines that Numba residual reduction is slower than giotto-ph, or when `backend='giotto'` is explicitly requested
+
+The pipeline:
 1. GPU-computed sparse edges → COO matrix on CPU
 2. `gph.ripser_parallel(sparse_dm, collapse_edges=True)` — C++ lockfree parallel reduction
 
@@ -215,8 +229,8 @@ The key: GPU edge enumeration produces a **pre-thresholded sparse COO matrix** t
 | Edge enumeration | $O(n^2 d)$ | $O(n^2 d / B^2)$ parallel | $B^2$ GPU blocks |
 | H0 (MST) | $O(E \log E)$ serial | $O(E \log n)$ with $O(E)$ parallelism | GPU parallel |
 | Triangle enumeration | implicit | $O(E \cdot \bar{d})$ parallel | GPU parallel |
-| Apparent pairs | $O(E)$ serial | $O(E / B_E)$ parallel | $B_E = 128$ |
-| Residual reduction | $O(E_{res} \cdot \bar{c})$ | same (CPU) | Only ~2% of $E$ |
+| Apparent pairs | $O(E)$ serial | $O(E)$ GPU scatter/search | GPU-parallel |
+| Residual reduction | $O(E_{res} \cdot \bar{c})$ | same (CPU), adaptive fallback | Only ~2% of $E$ |
 
 Where:
 - $B$ = block size for edge enumeration (128)

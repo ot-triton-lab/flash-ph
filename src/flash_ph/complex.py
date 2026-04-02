@@ -39,8 +39,19 @@ class RipsComplex:
         self._diagrams = None
         self._max_dim = None
 
-    def compute_persistence(self, max_dim: int = 1, homology_coeff_field: int = 2):
+    def compute_persistence(self, max_dim: int = 1, homology_coeff_field: int = 2,
+                             backend: str = 'auto'):
         """Compute persistent homology and store results.
+
+        Parameters
+        ----------
+        max_dim : int
+            Maximum homology dimension (0, 1, or 2). Default 1.
+        homology_coeff_field : int
+            Must be 2 (Z/2Z). Kept for GUDHI API compatibility.
+        backend : str
+            H1 reduction backend (``'auto'``, ``'gpu'``, or ``'giotto'``).
+            Only used when ``max_dim=1`` on CUDA. Default ``'auto'``.
 
         Returns None (GUDHI convention).
         """
@@ -49,6 +60,7 @@ class RipsComplex:
         self._max_dim = max_dim
         self._diagrams = rips_persistence(
             self._points, self._max_edge_length, max_dim=max_dim,
+            backend=backend,
         )
 
     def persistence(self, max_dim: int = 1, homology_coeff_field: int = 2):
