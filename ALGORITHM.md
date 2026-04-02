@@ -354,7 +354,7 @@ The first GPU-accelerated Rips PH software. Parallelizes apparent pair detection
 
 Lockfree multicore C++ implementation of ripser + GUDHI edge collapse. Establishes the CPU state-of-the-art, surpassing Ripser++ with 5-10 CPU cores. flash-ph uses giotto-ph as its C++ backend for H1 fallback and H2 computation.
 
-- Burella Schiavo, J. et al. "giotto-ph: A Python Library for High-Performance Computation of Persistent Homology of Vietoris-Rips Filtrations." *arXiv:2107.05412*, 2021.
+- Burella Perez, J., Hauke, S., Lupo, U., Caorsi, M., and Dassatti, A. "giotto-ph: A Python Library for High-Performance Computation of Persistent Homology of Vietoris-Rips Filtrations." *arXiv:2107.05412*, 2021.
 
 ### 8.4 Edge Collapse (Boissonnat & Pritam, SoCG 2020)
 
@@ -370,7 +370,7 @@ The first fully GPU-parallelized *explicit* boundary matrix reduction. Uses spec
 
 This is the most promising complement to flash-ph: SpecSeq++ parallelizes the *reduction* stage (the part flash-ph delegates to CPU). Combining flash-ph's GPU sparse complex construction with SpecSeq++-style GPU reduction could eliminate the dense-regime bottleneck entirely.
 
-- "SpecSeq++: A high parallel boundary matrix reduction to support real large-scale point clouds." *JPDC*, 2025.
+- Li, Q., Huang, Z., Chen, Y., Hu, D., Dai, Z., Yu, M., and Liu, Z. "SpecSeq++: A high parallel boundary matrix reduction to support real large-scale point clouds." *JPDC*, Vol. 198, 2025.
 
 ### 8.6 Sparse Rips Approximations (Sheehy, 2013; Cavanna et al., 2015)
 
@@ -379,13 +379,13 @@ Constructs an $O(n)$-size filtered complex whose persistence diagram $(1+\epsilo
 **Relation**: This is an *approximation* with linear complexity, while flash-ph computes *exact* persistence on a thresholded subcomplex. The sparsity structures differ fundamentally — geometric net-based sparsification vs threshold-based pruning.
 
 - Sheehy, D. "Linear-Size Approximations to the Vietoris-Rips Filtration." *DCG*, 2013.
-- Cavanna, N., Jahanseir, M., Sheehy, D. "A Geometric Perspective on Sparse Filtrations." *CGF*, 2015.
+- Cavanna, N., Jahanseir, M., and Sheehy, D. "A Geometric Perspective on Sparse Filtrations." *CCCG*, 2015. arXiv:1506.03797.
 
 ### 8.7 Flood Complex (NeurIPS 2025)
 
 Computes PH on millions of points by flooding a Delaunay triangulation of a small landmark subset. GPU-accelerated via PyTorch. Scales to $n > 10^6$ in 3D. flash-tda (the parent project) implements the Flood complex as `flood_persistence`.
 
-- "The Flood Complex: Large-Scale Persistent Homology on Millions of Points." *NeurIPS*, 2025.
+- Graf, F., Pellizzoni, P., Uray, M., Huber, S., and Kwitt, R. "The Flood Complex: Large-Scale Persistent Homology on Millions of Points." *NeurIPS*, 2025. arXiv:2509.22432.
 
 ### 8.8 Differentiable PH — TopologyLayer, torchph
 

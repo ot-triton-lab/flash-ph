@@ -114,7 +114,7 @@ flash-ph builds on and complements several lines of work in computational persis
 |--------|------|----------|------|--------------------|
 | **Ripser** (Bauer) | 2021 | Cohomology + apparent pairs (~98% of columns) | No | Implicit coboundary matrix |
 | **Ripser++** (Zhang et al.) | 2020 | GPU apparent pair detection via hashmap | CUDA | Dense distance matrix → GPU hashmap |
-| **giotto-ph** (Burella Schiavo et al.) | 2021 | Lockfree parallel C++ + edge collapse | No (multicore) | Edge collapse on 1-skeleton |
+| **giotto-ph** (Burella Perez et al.) | 2021 | Lockfree parallel C++ + edge collapse | No (multicore) | Edge collapse on 1-skeleton |
 | **Edge Collapse** (Boissonnat & Pritam) | 2020 | Remove dominated edges preserving PH | No | Graph-only preprocessing |
 | **SpecSeq++** | 2025 | GPU-parallel boundary matrix reduction via spectral sequences | CUDA | Dynamic block partition of boundary matrix |
 | **Sparse Rips** (Sheehy; Cavanna et al.) | 2013/2015 | O(n)-size approximate filtration via greedy nets | No | Geometric net-based sparsification |
