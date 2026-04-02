@@ -310,42 +310,59 @@ The 98%/2% split (GPU apparent pairs / CPU residual) is the sweet spot: the GPU 
 
 ### Scaling Limits (A100-80GB, H0+H1)
 
-Empirical scaling on Gaussian point clouds with thresholds chosen to keep the Rips graph sparse. flash-ph targets $d \geq 4$ where Alpha complexes are unavailable.
+flash-ph targets $d \geq 4$ where Alpha complexes are unavailable. The practical ceiling depends critically on **graph density**, which in turn depends on the interplay between the data geometry and the threshold.
 
-**$d = 4$ (Clifford torus regime):**
+#### High-Dimensional Data (Sparse Regime)
+
+In $d \geq 10$, distance concentration keeps the Rips graph naturally sparse at moderate thresholds. This is flash-ph's sweet spot:
+
+| n | d | threshold | edges | time | GPU mem |
+|---|---|-----------|-------|------|---------|
+| 10,000 | 10 | 1.60 | 26K | 19ms | 19MB |
+| 100,000 | 10 | 1.10 | 81K | 114ms | 266MB |
+| 500,000 | 10 | 0.90 | 298K | 2.0s | 6.5GB |
+| 50,000 | 50 | 6.20 | 31K | 134ms | 75MB |
+| 200,000 | 50 | 6.00 | 176K | 1.7s | 1.1GB |
+
+$d = 4$ with sparse thresholds (local structure, not full manifold topology):
 
 | n | threshold | edges | time | GPU mem |
 |---|-----------|-------|------|---------|
-| 10,000 | 0.55 | 131K | 301ms | 229MB |
 | 50,000 | 0.35 | 566K | 942ms | 857MB |
 | 200,000 | 0.23 | 1.7M | 3.3s | 2.0GB |
-| 500,000 | 0.15 | 2.0M | 3.0s | 6.5GB |
-| **1,000,000** | **0.11** | **2.3M** | **4.9s** | **26GB** |
+| 1,000,000 | 0.11 | 2.3M | 4.9s | 26GB |
 
-**$d = 10$ (high-dimensional sweet spot):**
+#### Low-Dimensional Manifolds (Dense Regime)
 
-| n | threshold | edges | time | GPU mem |
-|---|-----------|-------|------|---------|
-| 10,000 | 1.60 | 26K | 19ms | 19MB |
-| 100,000 | 1.10 | 81K | 114ms | 266MB |
-| 500,000 | 0.90 | 298K | 2.0s | 6.5GB |
+For data sampled from a low-dimensional manifold (e.g., the Clifford torus $T^2 \subset \mathbb{R}^4$, a 2D manifold in 4D ambient space), topology-preserving thresholds produce **dense** Rips graphs. This is a fundamental limitation of the Rips complex, not specific to flash-ph.
 
-**$d = 50$ (extreme high-d — distance concentration):**
+On the Clifford torus with threshold $\varepsilon = 1.10$ (needed for correct $\beta_1 = 2$ via essential bars):
 
-| n | threshold | edges | time | GPU mem |
-|---|-----------|-------|------|---------|
-| 10,000 | 6.50 | 5K | 37ms | 9MB |
-| 100,000 | 6.10 | 76K | 322ms | 282MB |
-| 200,000 | 6.00 | 176K | 1.7s | 1.1GB |
+| n | edges | density | triangles | topology correct? |
+|---|-------|---------|-----------|-------------------|
+| 500 | 29K | 23% | ~1.5M | Yes ($H_1$ ess = 2) |
+| 1,000 | 117K | 23% | ~12M | Yes ($H_1$ ess = 2) |
+| 2,000 | ~470K | 23% | ~42M | Triangle limit exceeded |
 
-**Hard constraints**:
+**Why**: the torus is a 2D manifold, so for a fixed threshold the number of neighbors per point is $O(n \cdot \varepsilon^2 / \text{area})$ — density stays at ~23% regardless of $n$. Edge count grows as $O(n^2)$ and triangle count as $O(n^3)$. All Rips-based methods (ripser, giotto-ph, flash-ph) hit this wall.
+
+**Practical limits by data type:**
+
+| Data type | Max n (correct topology) | Max n (sparse threshold) | Recommended alternative |
+|-----------|------------------------|-------------------------|------------------------|
+| Random $d \geq 10$ | ~500K | ~500K (same) | — |
+| Random $d = 4$ | ~1K (topology-preserving) | ~1M (local features) | — |
+| 2D manifold in $\mathbb{R}^4$ | **~1K** | ~1M (no topology) | Flood complex, Alpha ($d \leq 3$) |
+| 1D manifold (circle) | ~500 (topology-preserving) | ~1M (local) | Alpha complex |
+
+For large-scale manifold data where global topology matters, use the **Flood complex** (available in flash-tda as `flood_persistence`) which avoids the dense Rips problem by flooding a Delaunay triangulation of landmarks.
+
+#### Hard Constraints
 
 1. **H2 vertex limit**: $n < 65{,}536$ (16-bit packing in int64 keys). Does not apply to H0/H1.
-2. **Triangle safety limit**: `max_triangles=10M` by default. Fires when threshold is too large relative to $n$ (e.g., `auto_threshold(k=20)` on $n=10K$ $d=4$ can produce 85M triangles). Configurable via parameter.
-3. **GPU memory**: dominant allocations are edge arrays ($3E$ tensors), CSR adjacency ($O(n+E)$), and triangle arrays ($4T$ tensors). At $n=1M$ $d=4$, this reaches 26GB.
-4. **Practical ceiling**: $n \approx 1M$ on A100-80GB with a sparse threshold. In higher dimensions ($d \geq 10$), distances concentrate naturally, so `auto_threshold` keeps the graph sparse even at large $n$.
-
-The ceiling is **not $n$ itself** but the product of $n$ and graph density. At 0.01% density, $n = 1M$ produces only 2.3M edges — tractable in 5 seconds. At 50% density, even $n = 500$ produces 60K edges and 2.9M triangles — enough to overwhelm the reduction stage.
+2. **Triangle safety limit**: `max_triangles=10M` by default. Fires when the threshold produces a dense graph. Configurable via parameter.
+3. **GPU memory**: dominant allocations are edge arrays ($3E$ tensors), CSR adjacency ($O(n+E)$), and triangle arrays ($4T$ tensors). At $n=1M$ $d=4$ with sparse threshold, this reaches 26GB.
+4. **Practical ceiling**: $n \times \text{density}$ determines tractability. At 0.01% density, $n = 1M$ produces 2.3M edges (5 seconds). At 23% density, $n = 2K$ produces 42M triangles (infeasible).
 
 ## 7. Numerical Considerations
 

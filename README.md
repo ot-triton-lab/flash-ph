@@ -108,35 +108,38 @@ Ripser: CPU, full O(n^2) distance matrix. Giotto-ph: CPU, 8 threads, sparse radi
 
 ### Scaling (H0+H1, A100-80GB)
 
-How large can flash-ph go? The practical limit is GPU memory and threshold choice, not n itself. flash-ph targets d >= 4, where Alpha complexes are unavailable and Rips is the standard approach.
+How large can flash-ph go? The practical limit is **n x graph density**, not n alone. flash-ph targets d >= 4, where Alpha complexes are unavailable and Rips is the standard approach.
 
-**d=4 (Clifford torus regime):**
+**High-dimensional data (sparse regime — flash-ph sweet spot):**
+
+In d >= 10, distance concentration keeps the Rips graph naturally sparse at moderate thresholds. This is where flash-ph scales to very large n:
+
+| n | d | threshold | edges | time | GPU mem |
+|---|---|-----------|-------|------|---------|
+| 10K | 10 | 1.60 | 26K | 19ms | 19MB |
+| 100K | 10 | 1.10 | 81K | 114ms | 266MB |
+| 500K | 10 | 0.90 | 298K | 2.0s | 6.5GB |
+| 50K | 50 | 6.20 | 31K | 134ms | 75MB |
+| 200K | 50 | 6.00 | 176K | 1.7s | 1.1GB |
+
+**d=4 with sparse thresholds** (local structure, not full manifold topology):
 
 | n | threshold | edges | time | GPU mem |
 |---|-----------|-------|------|---------|
-| 10K | 0.55 | 131K | 301ms | 229MB |
 | 50K | 0.35 | 566K | 942ms | 857MB |
 | 200K | 0.23 | 1.7M | 3.3s | 2.0GB |
 | 500K | 0.15 | 2.0M | 3.0s | 6.5GB |
 | **1M** | **0.11** | **2.3M** | **4.9s** | **26GB** |
 
-**d=10 (high-dimensional sweet spot):**
+**Important: manifolds vs random data.** The n=1M result above uses random Gaussian data with a sparse threshold. For **low-dimensional manifolds** (e.g., Clifford torus T² in R⁴) where capturing topology requires a large threshold, the Rips graph is much denser:
 
-| n | threshold | edges | time | GPU mem |
-|---|-----------|-------|------|---------|
-| 10K | 1.60 | 26K | 19ms | 19MB |
-| 100K | 1.10 | 81K | 114ms | 266MB |
-| 200K | 1.00 | 132K | 350ms | 1.0GB |
-| 500K | 0.90 | 298K | 2.0s | 6.5GB |
+| Data | n | threshold | edges | density | H1 correct? |
+|------|---|-----------|-------|---------|-------------|
+| Clifford torus | 500 | 1.10 | 29K | 23% | Yes (H1_ess=2) |
+| Clifford torus | 1,000 | 1.10 | 117K | 23% | Yes (H1_ess=2) |
+| Clifford torus | 2,000 | 1.10 | — | 23% | Triangle count exceeds 42M |
 
-**d=50 (extreme high-d):**
-
-| n | threshold | edges | time | GPU mem |
-|---|-----------|-------|------|---------|
-| 10K | 6.50 | 5K | 37ms | 9MB |
-| 50K | 6.20 | 31K | 134ms | 75MB |
-| 100K | 6.10 | 76K | 322ms | 282MB |
-| 200K | 6.00 | 176K | 1.7s | 1.1GB |
+On a 2D manifold, edge density is **fixed by the threshold** (not by n), so E grows as O(n²) at any topology-preserving threshold. This is a fundamental limitation of Rips complexes, not specific to flash-ph — ripser and giotto-ph hit the same wall. For large-scale manifold data, use the **Flood complex** (available in flash-tda) or **Alpha complex** (d <= 3) instead.
 
 **Hard limits:**
 
@@ -145,9 +148,8 @@ How large can flash-ph go? The practical limit is GPU memory and threshold choic
 | n for H2 | < 65,536 | 16-bit vertex packing in int64 keys |
 | Triangle count | < 10M (default) | `max_triangles` safety limit (configurable) |
 | GPU memory | ~80GB (A100) | Edge + triangle + CSR arrays scale with E and T |
-| Practical H1 | **~1M points** | 5s, 26GB on A100-80GB (d=4, sparse threshold) |
-
-The bottleneck is the **sparsity-memory tradeoff**: at a given threshold, the number of edges E determines both GPU memory usage and runtime. In higher dimensions (d >= 10), distances concentrate and `auto_threshold` naturally produces sparse graphs even at large n.
+| High-d random data | **~1M points** | 5s, 26GB on A100-80GB (d=4, sparse threshold) |
+| Low-d manifold (topology-preserving) | **~1K points** | Density fixed by manifold geometry |
 
 ## Related Work
 
