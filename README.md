@@ -106,6 +106,32 @@ flash-ph targets **high-dimensional point clouds (d > 3)** where distance concen
 
 Ripser: CPU, full O(n^2) distance matrix. Giotto-ph: CPU, 8 threads, sparse radius-neighbor input.
 
+### Scaling (H0+H1, A100-80GB)
+
+How large can flash-ph go? The practical limit is GPU memory and threshold choice, not n itself.
+
+| n | d | threshold | edges | time | GPU mem |
+|---|---|-----------|-------|------|---------|
+| 10K | 3 | 0.20 | 36K | 239ms | 20MB |
+| 50K | 3 | 0.10 | 117K | 68ms | 66MB |
+| 100K | 3 | 0.08 | 241K | 178ms | 263MB |
+| 500K | 3 | 0.04 | 753K | 1.3s | 6.5GB |
+| **1M** | **3** | **0.03** | **1.3M** | **4.0s** | **26GB** |
+| 10K | 10 | 1.60 | 26K | 40ms | 17MB |
+| 100K | 10 | 1.10 | 82K | 130ms | 266MB |
+| 500K | 10 | 0.90 | 297K | 2.0s | 6.5GB |
+
+**Hard limits:**
+
+| Constraint | Limit | Reason |
+|-----------|-------|--------|
+| n for H2 | < 65,536 | 16-bit vertex packing in int64 keys |
+| Triangle count | < 10M (default) | `max_triangles` safety limit (configurable) |
+| GPU memory | ~80GB (A100) | Edge + triangle + CSR arrays scale with E and T |
+| Practical H1 | **~1M points** | 4s, 26GB on A100-80GB with sparse threshold |
+
+The bottleneck is the **sparsity-memory tradeoff**: at a given threshold, the number of edges E determines both GPU memory usage and runtime. In high dimensions (d >= 10), distances concentrate and `auto_threshold` naturally produces sparse graphs even at large n.
+
 ## Related Work
 
 flash-ph builds on and complements several lines of work in computational persistent homology:

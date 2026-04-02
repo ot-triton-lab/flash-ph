@@ -308,6 +308,30 @@ The column reduction (Numba residual + giotto-ph C++) remains on CPU because:
 
 The 98%/2% split (GPU apparent pairs / CPU residual) is the sweet spot: the GPU handles the embarrassingly parallel part, the CPU handles the inherently serial part.
 
+### Scaling Limits (A100-80GB, H0+H1)
+
+Empirical scaling on Gaussian point clouds with thresholds chosen to keep the Rips graph sparse:
+
+| n | d | threshold | edges | time | GPU mem |
+|---|---|-----------|-------|------|---------|
+| 10,000 | 3 | 0.20 | 36K | 239ms | 20MB |
+| 50,000 | 3 | 0.10 | 117K | 68ms | 66MB |
+| 100,000 | 3 | 0.08 | 241K | 178ms | 263MB |
+| 500,000 | 3 | 0.04 | 753K | 1.3s | 6.5GB |
+| **1,000,000** | **3** | **0.03** | **1.3M** | **4.0s** | **26GB** |
+| 10,000 | 10 | 1.60 | 26K | 40ms | 17MB |
+| 100,000 | 10 | 1.10 | 82K | 130ms | 266MB |
+| 500,000 | 10 | 0.90 | 297K | 2.0s | 6.5GB |
+
+**Hard constraints**:
+
+1. **H2 vertex limit**: $n < 65{,}536$ (16-bit packing in int64 keys). Does not apply to H0/H1.
+2. **Triangle safety limit**: `max_triangles=10M` by default. Fires when threshold is too large relative to $n$ (e.g., `auto_threshold(k=20)` on $n=10K$ d=3 produces 85M triangles). Configurable via parameter.
+3. **GPU memory**: dominant allocations are edge arrays ($3E$ tensors), CSR adjacency ($O(n+E)$), and triangle arrays ($4T$ tensors). At $n=1M$ d=3, this reaches 26GB.
+4. **Practical ceiling**: $n \approx 1M$ on A100-80GB with a sparse threshold. In higher dimensions ($d \geq 10$), distances concentrate naturally, so `auto_threshold` keeps the graph sparse even at large $n$.
+
+The ceiling is **not $n$ itself** but the product of $n$ and graph density. At 0.01% density, $n = 1M$ produces only 1.3M edges — easily tractable. At 50% density, even $n = 500$ produces 60K edges and 2.9M triangles — enough to overwhelm the reduction stage.
+
 ## 7. Numerical Considerations
 
 ### Float32 Throughout
