@@ -13,10 +13,12 @@ Key simplification vs Rips version:
 from __future__ import annotations
 
 
+import time
+
 import numpy as np
 import torch
 from torch import Tensor
-from numba import njit
+from numba import njit, objmode
 
 from flash_ph._numba_utils import (
     _hm_get, _hm_set, _sorted_merge_xor_single, MAX_COL, MAX_POOL_ENTRIES,
@@ -209,12 +211,22 @@ def _general_cohomology_reduce_v2(
     pre_hm_keys, pre_hm_vals, pre_hm_cap,
     pre_pool_data, pre_piv_start, pre_piv_length,
     pre_pool_ptr, pre_num_piv,
+    order,                  # (K,) int32 — np.argsort(col_ranks)[::-1]
+    budget_s=0.0,           # time budget in seconds (0 = unlimited)
 ):
     """Cohomology reduction v2: receives pre-populated state from GPU prepass.
 
     GPU apparent pairs are already in skip_mask (True) and their columns are
     pre-loaded into the hash map + pool. This kernel only processes residual
     (non-apparent, non-skipped) columns.
+
+    ``order`` must be ``np.argsort(col_ranks)[::-1]``, pre-computed by the
+    caller.  Accepting it as a parameter allows callers that invoke this
+    function repeatedly (chunked budget reduction) to sort once.
+
+    If ``budget_s > 0``, the function checks ``time.perf_counter()`` every
+    100 XOR iterations.  When the budget is exceeded, it returns early with
+    ``pool_ptr = -1`` as a timeout sentinel.
     """
     K = col_ranks.shape[0]
 
@@ -242,10 +254,15 @@ def _general_cohomology_reduce_v2(
     cur = np.empty(MAX_COL, dtype=np.int32)
     tmp = np.empty(MAX_COL, dtype=np.int32)
 
-    # Sort col_ranks indices by rank DESCENDING for processing order
-    order = np.argsort(col_ranks)[::-1]
+    # Time budget tracking via objmode (Numba doesn't support time.* natively)
+    has_budget = budget_s > 0.0
+    t_start = 0.0
+    if has_budget:
+        with objmode(t_start='float64'):
+            t_start = time.perf_counter()
 
-    for ki in range(K):
+    n_order = order.shape[0]
+    for ki in range(n_order):
         idx = order[ki]
         if skip_mask[idx]:
             continue
@@ -291,6 +308,8 @@ def _general_cohomology_reduce_v2(
             cur[i] = cofacet_ranks[c_start + i]
 
         # Reduction loop
+        xor_iters = 0
+        timed_out = False
         while cn > 0:
             piv = cur[0]
             piv_idx = _hm_get(hm_keys, hm_vals, hm_cap, np.int64(piv))
@@ -306,6 +325,21 @@ def _general_cohomology_reduce_v2(
             )
             for i in range(cn):
                 cur[i] = tmp[i]
+
+            # Intra-column budget check (every 100 XOR iterations)
+            xor_iters += 1
+            if has_budget and xor_iters % 100 == 0:
+                over = False
+                with objmode(over='boolean'):
+                    over = (time.perf_counter() - t_start) > budget_s
+                if over:
+                    timed_out = True
+                    break
+
+        if timed_out:
+            return (pair_births[:n_pairs], pair_deaths[:n_pairs],
+                    ess_births[:n_ess], all_pivots[:n_all_piv],
+                    np.int64(-1), num_piv)
 
         if cn > 0:
             piv = cur[0]
@@ -332,7 +366,9 @@ def _general_cohomology_reduce_v2(
             ess_births[n_ess] = r_e
             n_ess += 1
 
-    return pair_births[:n_pairs], pair_deaths[:n_pairs], ess_births[:n_ess], all_pivots[:n_all_piv]
+    return (pair_births[:n_pairs], pair_deaths[:n_pairs],
+            ess_births[:n_ess], all_pivots[:n_all_piv],
+            pool_ptr, num_piv)
 
 
 # ---------------------------------------------------------------------------
@@ -559,10 +595,12 @@ def _general_cohomology_reduce_gpu_prepass(
     )
 
     # --- Step 6: Call v2 Numba kernel ---
-    pb, pd, eb, ap = _general_cohomology_reduce_v2(
+    col_order = np.argsort(col_np)[::-1].copy()
+    pb, pd, eb, ap, _, _ = _general_cohomology_reduce_v2(
         col_np, off_np, cof_np, skip_np, r2f_np, cmf_np,
         hm_keys, hm_vals, hm_cap,
         pool_data, piv_start, piv_length, pool_ptr, num_piv,
+        col_order,
     )
 
     # --- Step 7: Merge GPU apparent pair results with Numba results ---
@@ -633,10 +671,12 @@ def general_cohomology_reduce(
         piv_start = np.empty(K, dtype=np.int64)
         piv_length = np.empty(K, dtype=np.int32)
 
-        pb, pd, eb, ap = _general_cohomology_reduce_v2(
+        col_order = np.argsort(col_np)[::-1].copy()
+        pb, pd, eb, ap, _, _ = _general_cohomology_reduce_v2(
             col_np, off_np, cof_np, skip_np, r2f_np, cmf_np,
             hm_keys, hm_vals, hm_cap,
             pool_data, piv_start, piv_length, 0, 0,
+            col_order,
         )
 
         return (torch.from_numpy(pb.copy()).to(device),

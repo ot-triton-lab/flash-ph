@@ -69,6 +69,7 @@ def rips_persistence(
     points,
     max_edge_length: float,
     max_dim: int = 1,
+    backend: str = 'auto',
 ) -> list[Tensor]:
     """Exact Vietoris-Rips persistent homology (H0 + H1 + optional H2).
 
@@ -84,6 +85,11 @@ def rips_persistence(
     max_dim : int
         0 (H0 only), 1 (H0 + H1), or 2 (H0 + H1 + H2). Default 1.
         H2 uses 16-bit vertex packing internally, requiring n < 65536.
+    backend : str
+        H1 reduction backend (only used when ``max_dim=1`` on CUDA).
+        ``'auto'`` (default) — heuristic selects GPU-native or giotto-ph.
+        ``'gpu'`` — always use GPU-native (Numba residual).
+        ``'giotto'`` — always use giotto-ph C++ reduction.
 
     Returns
     -------
@@ -181,9 +187,11 @@ def rips_persistence(
 
     # Step 3+4: H1 (+H2)
     if max_dim == 1 and device.type == 'cuda':
-        # GPU-native H1 reduction (no giotto-ph dependency)
+        # GPU-native H1 reduction with adaptive giotto-ph fallback
         from flash_ph.reduce_h1_gpu import rips_h1_gpu_native
-        h1 = rips_h1_gpu_native(filt, n, mst_idx, device)
+        h1 = rips_h1_gpu_native(
+            filt, n, mst_idx, max_edge_length, device, backend=backend,
+        )
         return [h0, h1]
 
     # max_dim == 2 (or CPU fallback): giotto-ph C++ backend
