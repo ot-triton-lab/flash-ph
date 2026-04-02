@@ -536,3 +536,35 @@ def test_rips_complex_coeff_field_error():
 
     with pytest.raises(ValueError, match="Z/2Z"):
         rips.persistence(homology_coeff_field=7)
+
+
+def test_clifford_torus_betti():
+    """Clifford torus T² ⊂ R⁴ must have Betti numbers [1, 2, 1].
+
+    Uses threshold=1.4 (above all death times: H1 ~1.23, H2 ~1.28) so that
+    the real features appear as finite bars with a clear persistence gap.
+    """
+    torch.manual_seed(42)
+    n = 200
+    t = torch.rand(n, device=device) * 2 * torch.pi
+    s = torch.rand(n, device=device) * 2 * torch.pi
+    pts = torch.stack([torch.cos(t), torch.sin(t),
+                       torch.cos(s), torch.sin(s)], dim=1) / (2 ** 0.5)
+    pts += torch.randn_like(pts) * 0.02
+
+    diagrams = rips_persistence(pts, max_edge_length=1.4, max_dim=2)
+
+    # H0: exactly 1 connected component (essential bar)
+    h0 = diagrams[0]
+    n_components = torch.isinf(h0[:, 1]).sum().item()
+    assert n_components == 1, f"H0: expected 1 component, got {n_components}"
+
+    # H1, H2: count bars with persistence > 0.4 (clear gap from noise)
+    for dim, expected_betti in [(1, 2), (2, 1)]:
+        dgm = diagrams[dim]
+        finite = dgm[torch.isfinite(dgm[:, 1])]
+        pers = finite[:, 1] - finite[:, 0]
+        significant = (pers > 0.4).sum().item()
+        assert significant == expected_betti, (
+            f"H{dim}: expected {expected_betti} significant bars, got {significant}"
+        )

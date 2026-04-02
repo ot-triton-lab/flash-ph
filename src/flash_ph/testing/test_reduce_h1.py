@@ -59,7 +59,7 @@ def _compare_h1_diagrams(gpu_dgm, ref_dgm, atol=1e-4):
 @pytest.mark.parametrize("seed", [42, 43, 44])
 def test_h1_small_random_d2(seed):
     """Small 2D random point cloud, H1 parity vs ripser."""
-    import ripser
+    ripser = pytest.importorskip("ripser")
     rng = np.random.default_rng(seed)
     pts_np = rng.standard_normal((30, 2)).astype(np.float32)
     thresh = 1.5
@@ -76,7 +76,7 @@ def test_h1_small_random_d2(seed):
 @pytest.mark.parametrize("seed", [42, 43])
 def test_h1_small_random_d4(seed):
     """Small 4D random point cloud, H1 parity vs ripser."""
-    import ripser
+    ripser = pytest.importorskip("ripser")
     rng = np.random.default_rng(seed)
     pts_np = rng.standard_normal((25, 4)).astype(np.float32)
     thresh = 2.0
@@ -92,7 +92,7 @@ def test_h1_small_random_d4(seed):
 
 def test_h1_small_d10():
     """Small 10D random, H1 parity."""
-    import ripser
+    ripser = pytest.importorskip("ripser")
     rng = np.random.default_rng(42)
     pts_np = rng.standard_normal((20, 10)).astype(np.float32)
     thresh = 3.0
@@ -112,7 +112,7 @@ def test_h1_small_d10():
 
 def test_h1_medium_clifford():
     """Clifford torus n=200, H1 parity."""
-    import ripser
+    ripser = pytest.importorskip("ripser")
     n = 200
     rng = np.random.default_rng(42)
     theta = rng.uniform(0, 2 * np.pi, n).astype(np.float32)
@@ -134,7 +134,7 @@ def test_h1_medium_clifford():
 
 def test_h1_medium_random_n100():
     """Random n=100 d=3, H1 parity."""
-    import ripser
+    ripser = pytest.importorskip("ripser")
     rng = np.random.default_rng(42)
     pts_np = rng.standard_normal((100, 3)).astype(np.float32)
     thresh = 1.5
@@ -150,7 +150,7 @@ def test_h1_medium_random_n100():
 
 def test_h1_medium_n200_d9():
     """O(3)-like n=200 d=9, H1 parity."""
-    import ripser
+    ripser = pytest.importorskip("ripser")
     rng = np.random.default_rng(42)
     matrices = rng.standard_normal((200, 3, 3))
     pts_np = np.empty((200, 9), dtype=np.float32)
@@ -185,7 +185,7 @@ def test_h1_no_edges():
 
 def test_h1_single_component_no_holes():
     """Tight cluster → single component, no H1 features."""
-    import ripser
+    ripser = pytest.importorskip("ripser")
     rng = np.random.default_rng(42)
     pts_np = rng.standard_normal((10, 2)).astype(np.float32) * 0.01
     thresh = 0.5  # all pairwise distances well within threshold
@@ -201,7 +201,7 @@ def test_h1_single_component_no_holes():
 
 def test_h1_essential_features():
     """Circle with large threshold → should have essential H1."""
-    import ripser
+    ripser = pytest.importorskip("ripser")
     n = 30
     theta = np.linspace(0, 2 * np.pi, n, endpoint=False).astype(np.float32)
     pts_np = np.column_stack([np.cos(theta), np.sin(theta)]).astype(np.float32)
@@ -229,7 +229,7 @@ def test_h1_essential_features():
 
 def test_h1_sphere3_192():
     """sphere3 192 points, no threshold, H1 parity."""
-    import ripser
+    ripser = pytest.importorskip("ripser")
     from scipy.spatial.distance import pdist
     rng = np.random.default_rng(42)
     pts_np = rng.standard_normal((192, 4)).astype(np.float32)
@@ -247,7 +247,7 @@ def test_h1_sphere3_192():
 
 def test_h1_o3_1024():
     """O(3) 1024 points, thresh=1.8, H1 parity."""
-    import ripser
+    ripser = pytest.importorskip("ripser")
     rng = np.random.default_rng(42)
     n = 1024
     matrices = rng.standard_normal((n, 3, 3))

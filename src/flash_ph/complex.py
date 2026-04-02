@@ -26,6 +26,10 @@ class RipsComplex:
     """
 
     def __init__(self, points, max_edge_length: float):
+        if max_edge_length < 0:
+            raise ValueError(
+                f"max_edge_length must be non-negative, got {max_edge_length}"
+            )
         if isinstance(points, np.ndarray):
             points = torch.from_numpy(points).float()
             if torch.cuda.is_available():

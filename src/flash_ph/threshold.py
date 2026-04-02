@@ -46,6 +46,14 @@ def auto_threshold(
     -------
     float
         Estimated threshold (Euclidean distance).
+
+    Notes
+    -----
+    The default ``k=20`` captures local density scale, which may be much
+    smaller than the scale at which global topology lives.  For manifolds
+    like the Clifford torus (H1 features die at ~1.23, H2 at ~1.28), use
+    ``k >= 50`` or ``enclosing_radius()`` to ensure the threshold is large
+    enough to detect all homological features.
     """
     pts = _to_tensor(points)
     n = pts.shape[0]

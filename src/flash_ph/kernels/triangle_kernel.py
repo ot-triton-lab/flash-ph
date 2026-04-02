@@ -320,7 +320,7 @@ def triangle_enumerate(
 
     # CPU fallback
     if device.type != "cuda" or not _HAS_TRITON:
-        from flash_ph.persistence import _enumerate_rips_triangles
+        from flash_ph._numba_utils import _enumerate_rips_triangles
         rv0, rv1, rv2, rmr = _enumerate_rips_triangles(
             edge_i.cpu().numpy(), edge_j.cpu().numpy(),
             adj_ptr.cpu().numpy(), adj_idx.cpu().numpy(),
@@ -347,7 +347,7 @@ def triangle_enumerate(
     # High-degree fallback: Triton compiles a loop of 2*MAX_DEGREE iterations
     # as constexpr; very high degree graphs cause slow JIT compilation.
     if max_deg_po2 > 4096:
-        from flash_ph.persistence import _enumerate_rips_triangles
+        from flash_ph._numba_utils import _enumerate_rips_triangles
         rv0, rv1, rv2, rmr = _enumerate_rips_triangles(
             edge_i.cpu().numpy(), edge_j.cpu().numpy(),
             adj_ptr.cpu().numpy(), adj_idx.cpu().numpy(),
@@ -433,7 +433,7 @@ def tetrahedra_enumerate(
 
     # CPU fallback
     if device.type != "cuda" or not _HAS_TRITON:
-        from flash_ph.persistence import _enumerate_rips_tetrahedra
+        from flash_ph._numba_utils import _enumerate_rips_tetrahedra
         rv = _enumerate_rips_tetrahedra(
             tri_v0.cpu().numpy(), tri_v1.cpu().numpy(),
             tri_v2.cpu().numpy(), tri_max_rank.cpu().numpy(),
@@ -456,7 +456,7 @@ def tetrahedra_enumerate(
 
     # High-degree fallback to CPU Numba
     if max_deg_po2 > 4096:
-        from flash_ph.persistence import _enumerate_rips_tetrahedra
+        from flash_ph._numba_utils import _enumerate_rips_tetrahedra
         rv = _enumerate_rips_tetrahedra(
             tri_v0.cpu().numpy(), tri_v1.cpu().numpy(),
             tri_v2.cpu().numpy(), tri_max_rank.cpu().numpy(),
