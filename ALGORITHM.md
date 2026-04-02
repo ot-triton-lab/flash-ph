@@ -333,3 +333,77 @@ key = v0 + (v1 << 16) + (v2 << 32) + (v3 << 48)  # tetrahedron
 This limits vertex count to $n < 65536$ (16 bits per vertex) but enables $O(\log n)$ lookup via `torch.searchsorted` instead of $O(1)$ Python dict lookup with enormous constant factor.
 
 For tetrahedron colex ranks, naive computation of $\binom{n}{4}$ overflows `int64`. flash-ph uses early division: `v*(v-1)//2 * (v-2)*(v-3)//2 // 6`.
+
+## 8. Related Work and Landscape
+
+### 8.1 Ripser (Bauer, 2021)
+
+The foundational algorithm that flash-ph builds on. Introduced three key optimizations: cohomology instead of homology (process $E$ columns instead of $T$), apparent pairs (~98% resolved without reduction), and implicit coboundary matrix (never materializes the boundary matrix). All subsequent Rips PH software builds on these ideas.
+
+- Bauer, U. "Ripser: efficient computation of Vietoris-Rips persistence barcodes." *JACT*, 2021.
+
+### 8.2 Ripser++ (Zhang et al., SoCG 2020)
+
+The first GPU-accelerated Rips PH software. Parallelizes apparent pair detection on GPU using a 2-layer hashmap data structure. Achieves **30x over ripser**. Non-apparent columns fall back to CPU "submatrix reduction."
+
+**Key difference from flash-ph**: Ripser++ still constructs the full $O(n^2)$ distance matrix on CPU before GPU processing. flash-ph moves edge enumeration itself to GPU (Triton), producing a pre-thresholded sparse edge list. Ripser++ also uses CUDA C++ (harder to modify/extend), while flash-ph uses Triton/PyTorch. Ripser++ is unmaintained (last commit 2021).
+
+- Zhang, S. et al. "GPU-Accelerated Computation of Vietoris-Rips Persistence Barcodes." *SoCG*, 2020.
+
+### 8.3 giotto-ph (Burella Schiavo et al., 2021)
+
+Lockfree multicore C++ implementation of ripser + GUDHI edge collapse. Establishes the CPU state-of-the-art, surpassing Ripser++ with 5-10 CPU cores. flash-ph uses giotto-ph as its C++ backend for H1 fallback and H2 computation.
+
+- Burella Schiavo, J. et al. "giotto-ph: A Python Library for High-Performance Computation of Persistent Homology of Vietoris-Rips Filtrations." *arXiv:2107.05412*, 2021.
+
+### 8.4 Edge Collapse (Boissonnat & Pritam, SoCG 2020)
+
+Shows that "dominated" edges in a flag complex can be removed using only the 1-skeleton, preserving persistent homology. Reduces edge count by 66-86% as a preprocessing step. Implemented in GUDHI and giotto-ph.
+
+flash-ph exploits this via giotto-ph's `collapse_edges=True`: the GPU-computed sparse COO is the input, so edge collapse starts from fewer edges than a dense point cloud.
+
+- Boissonnat, J.-D. and Pritam, S. "Edge Collapse and Persistence of Flag Complexes." *SoCG*, 2020.
+
+### 8.5 SpecSeq++ (JPDC 2025)
+
+The first fully GPU-parallelized *explicit* boundary matrix reduction. Uses spectral sequence decomposition to partition the boundary matrix into blocks with dynamic load balancing. Reports **62-88x average speedup** (up to 775x peak) over serial reduction.
+
+This is the most promising complement to flash-ph: SpecSeq++ parallelizes the *reduction* stage (the part flash-ph delegates to CPU). Combining flash-ph's GPU sparse complex construction with SpecSeq++-style GPU reduction could eliminate the dense-regime bottleneck entirely.
+
+- "SpecSeq++: A high parallel boundary matrix reduction to support real large-scale point clouds." *JPDC*, 2025.
+
+### 8.6 Sparse Rips Approximations (Sheehy, 2013; Cavanna et al., 2015)
+
+Constructs an $O(n)$-size filtered complex whose persistence diagram $(1+\epsilon)$-approximates the full Rips filtration. Uses greedy permutations and growing/shrinking balls. The constant depends on doubling dimension.
+
+**Relation**: This is an *approximation* with linear complexity, while flash-ph computes *exact* persistence on a thresholded subcomplex. The sparsity structures differ fundamentally — geometric net-based sparsification vs threshold-based pruning.
+
+- Sheehy, D. "Linear-Size Approximations to the Vietoris-Rips Filtration." *DCG*, 2013.
+- Cavanna, N., Jahanseir, M., Sheehy, D. "A Geometric Perspective on Sparse Filtrations." *CGF*, 2015.
+
+### 8.7 Flood Complex (NeurIPS 2025)
+
+Computes PH on millions of points by flooding a Delaunay triangulation of a small landmark subset. GPU-accelerated via PyTorch. Scales to $n > 10^6$ in 3D. flash-tda (the parent project) implements the Flood complex as `flood_persistence`.
+
+- "The Flood Complex: Large-Scale Persistent Homology on Millions of Points." *NeurIPS*, 2025.
+
+### 8.8 Differentiable PH — TopologyLayer, torchph
+
+PyTorch layers that backpropagate through persistence diagrams. Not about speed per se, but about making PH usable in end-to-end gradient-based learning. flash-ph's kernels fall back to differentiable PyTorch when `requires_grad=True`, enabling integration.
+
+- Brüel-Gabrielsson, R. et al. "A Topology Layer for Machine Learning." *AISTATS*, 2020.
+- Hofer, C. et al. "torchph: PyTorch extensions for persistent homology."
+
+### 8.9 Summary: Where flash-ph Sits
+
+| Technique | Ripser | Ripser++ | giotto-ph | SpecSeq++ | Sparse Rips | flash-ph |
+|-----------|--------|----------|-----------|-----------|-------------|----------|
+| Edge enumeration | CPU $O(n^2)$ | CPU $O(n^2)$ | CPU $O(n^2)$ | CPU | CPU $O(n)$ approx | **GPU Triton** |
+| H0 (MST) | CPU serial | CPU serial | CPU serial | — | — | **GPU Boruvka** |
+| Apparent pairs | CPU serial | **GPU CUDA** | CPU parallel | — | — | **GPU PyTorch** |
+| Boundary reduction | CPU serial | CPU serial | CPU lockfree | **GPU parallel** | CPU serial | CPU (Numba/giotto) |
+| Edge collapse | No | No | **Yes (C++)** | No | N/A | Yes (via giotto) |
+| Exact? | Yes | Yes | Yes | Yes | No (approx) | **Yes** |
+| Sparse input? | COO | COO | Dense/COO | Dense | Geometric net | **Thresholded COO/CSR** |
+
+**The main open direction**: combining flash-ph's GPU sparse complex construction (stages 1-3) with SpecSeq++'s GPU boundary matrix reduction (stage 4) would create a fully GPU-native exact Rips PH pipeline with no CPU bottleneck.

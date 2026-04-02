@@ -106,6 +106,29 @@ flash-ph targets **high-dimensional point clouds (d > 3)** where distance concen
 
 Ripser: CPU, full O(n^2) distance matrix. Giotto-ph: CPU, 8 threads, sparse radius-neighbor input.
 
+## Related Work
+
+flash-ph builds on and complements several lines of work in computational persistent homology:
+
+| Method | Year | Key Idea | GPU? | Sparsity Structure |
+|--------|------|----------|------|--------------------|
+| **Ripser** (Bauer) | 2021 | Cohomology + apparent pairs (~98% of columns) | No | Implicit coboundary matrix |
+| **Ripser++** (Zhang et al.) | 2020 | GPU apparent pair detection via hashmap | CUDA | Dense distance matrix → GPU hashmap |
+| **giotto-ph** (Burella Schiavo et al.) | 2021 | Lockfree parallel C++ + edge collapse | No (multicore) | Edge collapse on 1-skeleton |
+| **Edge Collapse** (Boissonnat & Pritam) | 2020 | Remove dominated edges preserving PH | No | Graph-only preprocessing |
+| **SpecSeq++** | 2025 | GPU-parallel boundary matrix reduction via spectral sequences | CUDA | Dynamic block partition of boundary matrix |
+| **Sparse Rips** (Sheehy; Cavanna et al.) | 2013/2015 | O(n)-size approximate filtration via greedy nets | No | Geometric net-based sparsification |
+| **Flood Complex** | 2025 | Delaunay of landmarks + ball flooding | PyTorch | Witness-based subcomplex |
+| **flash-ph** | 2025 | GPU sparse edge enum + apparent pairs + adaptive fallback | **Triton** | **Thresholded sparse COO/CSR** |
+
+**What flash-ph contributes that no prior method does:**
+- GPU edge enumeration (Triton) that produces a pre-thresholded sparse COO — never materializes the full O(n²) distance matrix
+- GPU Boruvka MST for H0 (parallel union-find)
+- Sparse COO handoff to giotto-ph's edge collapse — starting from fewer edges than a dense point cloud
+- Adaptive time-budget fallback: monitors per-column Numba reduction cost and switches to giotto-ph when topology-dependent hard cases arise
+
+**Open direction:** SpecSeq++ (2025) GPU-parallelizes boundary matrix reduction itself — the one stage flash-ph still delegates to CPU. Combining flash-ph's GPU sparse complex construction with SpecSeq++-style GPU reduction could eliminate the dense-regime bottleneck entirely.
+
 ## Warmup
 
 The first call to `rips_persistence` pays Triton and Numba JIT compilation costs (typically 5--15 seconds depending on GPU and kernel configuration). Subsequent calls reuse cached kernels. All benchmark numbers above exclude warmup.
