@@ -364,7 +364,73 @@ For large-scale manifold data where global topology matters, use the **Flood com
 3. **GPU memory**: dominant allocations are edge arrays ($3E$ tensors), CSR adjacency ($O(n+E)$), and triangle arrays ($4T$ tensors). At $n=1M$ $d=4$ with sparse threshold, this reaches 26GB.
 4. **Practical ceiling**: $n \times \text{density}$ determines tractability. At 0.01% density, $n = 1M$ produces 2.3M edges (5 seconds). At 23% density, $n = 2K$ produces 42M triangles (infeasible).
 
-## 7. Numerical Considerations
+## 7. Roofline Analysis (A100-80GB)
+
+The A100-80GB has peak FP32 throughput of 19.5 TFLOPS and memory bandwidth of 2.0 TB/s, giving a **ridge point of 9.75 FLOP/byte**. Operations below this arithmetic intensity (AI) are memory-bound; above it, compute-bound.
+
+### Per-Stage Characterization
+
+| Stage | Arithmetic Intensity | Bound | Why |
+|-------|---------------------|-------|-----|
+| **Edge enumeration** | $\sim n \cdot d / 2$ FLOP/B (260–21,000) | **Compute** | Pairwise distance is pure arithmetic; output is sparse (few bytes written per n² comparisons). At n=100K d=10: 1.2 TFLOP/s attained (6% of peak). |
+| **Boruvka MST** | ~0.2 FLOP/B | **Memory** | Dominated by scattered reads/writes to union-find arrays. Each round scans all edges but does minimal arithmetic per edge. |
+| **Triangle enumeration** | ~0.3–0.8 FLOP/B | **Memory** | CSR merge-intersection is pointer-chasing: load two sorted adjacency lists, advance pointers based on comparisons. Irregular access patterns prevent coalescing. |
+| **Apparent pair detection** | ~1–2 FLOP/B | **Memory** | `scatter_reduce(min)` + `searchsorted` over cofacet CSR. Reduction is memory-bound; searchsorted has good locality but low arithmetic. |
+| **Numba residual** | ~0.1 FLOP/B | **Memory (CPU)** | Serial XOR chain-chasing on CPU. Completely latency-bound — each step depends on the previous pivot. |
+| **giotto-ph C++ reduction** | ~0.5 FLOP/B | **Memory (CPU)** | Lockfree parallel column reduction. Better than Numba but still memory-bound due to sparse column access patterns. |
+
+### Roofline Diagram (Conceptual)
+
+```
+                    A100-80GB Roofline
+  GFLOP/s
+  19,500 |..................................................... peak FP32
+         |                                              .
+         |                                         .
+   1,165 |  - - - - - - - - - - - - - - - - - ★ edge enum (n=100K d=10)
+         |                                .
+         |                           .
+         |                      .     ridge: 9.75 FLOP/byte
+         |                 .
+         |            .
+      52 |  - - ★ edge enum (n=10K d=10)
+         |       .
+      15 |  ★ edge enum (n=10K d=4)
+         |  .
+         | .
+         |.
+   2,000 |★ mem BW ceiling (2 TB/s)
+         |
+         | ★ Boruvka (0.2)       AI (FLOP/byte) →
+         | ★ Triangle enum (0.3-0.8)
+         | ★ Apparent pairs (1-2)
+         |___________________________________________________
+         0.1    1      10     100    1000   10000   100000
+```
+
+### Key Observations
+
+1. **Edge enumeration is compute-bound** and scales well with n and d. At n=100K d=10, it attains 1.2 TFLOP/s — respectable but only 6% of A100 peak. The gap is due to the threshold comparison + compaction (irregular output writes) preventing full utilization. Higher d increases AI linearly (more FLOPs per distance computation).
+
+2. **All other GPU stages are memory-bound.** Boruvka, triangle enumeration, and apparent pair detection are dominated by irregular memory access patterns (pointer chasing in CSR, scattered union-find updates, sparse scatter_reduce). These operations are fundamentally hard to compute-optimize on GPUs.
+
+3. **The CPU stages are latency-bound.** Numba residual reduction and giotto-ph C++ reduction chase pivot chains where each step depends on the previous result. No amount of memory bandwidth helps — it's serial data dependency.
+
+4. **The pipeline is balanced by design.** The compute-bound stage (edge enumeration) runs first and outputs a sparse representation. The memory-bound stages (Boruvka, triangles, apparent pairs) operate on this sparse output, keeping total data movement proportional to E, not n². The CPU stages handle only ~2% of columns.
+
+### Optimization Opportunities
+
+| Stage | Current bottleneck | Potential improvement |
+|-------|--------------------|----------------------|
+| Edge enum | Irregular output compaction | Warp-ballot compaction, two-pass (count then write) |
+| Boruvka | Scattered union-find updates | Path-halving, root compression in shared memory |
+| Triangle enum | Pointer chasing in CSR | Blocked CSR with shared-memory merge |
+| Apparent pairs | scatter_reduce atomics | Warp-level reduction, deterministic merge |
+| Residual reduction | Serial pivot chains (CPU) | **SpecSeq++ GPU parallel reduction** |
+
+The largest potential gain is replacing the CPU residual reduction with GPU-parallel boundary matrix reduction (SpecSeq++ approach). This would shift the bottleneck from "2% of columns on CPU" to "all columns on GPU" — eliminating the fundamental CPU/GPU handoff.
+
+## 8. Numerical Considerations
 
 ### Float32 Throughout
 
