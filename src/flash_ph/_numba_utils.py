@@ -12,6 +12,27 @@ MAX_POOL_ENTRIES = 100_000_000  # Cap pool at 100M entries (~1.2GB)
 
 
 @njit(cache=True)
+def _mst_persistence_deaths(mst_edges, n):
+    """Replay rank-ordered forest edges with the elder rule."""
+    parent = np.arange(n, dtype=np.int32)
+    deaths = np.full((n, 2), -1, dtype=np.int32)
+    for k in range(mst_edges.shape[0]):
+        u, v = mst_edges[k, 0], mst_edges[k, 1]
+        a, b = u, v
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        while parent[b] != b:
+            parent[b] = parent[parent[b]]
+            b = parent[b]
+        younger = max(a, b)
+        parent[younger] = min(a, b)
+        deaths[younger, 0] = u
+        deaths[younger, 1] = v
+    return deaths
+
+
+@njit(cache=True)
 def _hm_get(keys, vals, cap, key):
     """Open-addressing hash map lookup. Returns -1 if not found."""
     h = np.int64(key * np.int64(2654435761)) % np.int64(cap)
@@ -45,10 +66,10 @@ def _sorted_merge_xor_single(a, na, b, nb, out):
     """Symmetric difference of two sorted int32 arrays over Z/2Z.
 
     Elements cancel iff they match (each rank is unique).
-    Returns number of elements in output. Truncates at MAX_COL for safety.
+    Returns the number of elements written, up to the output capacity.
     """
     ia = ib = no = 0
-    limit = MAX_COL
+    limit = out.shape[0]
     while ia < na and ib < nb:
         if no >= limit:
             break

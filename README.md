@@ -60,6 +60,36 @@ pairs = rips.persistence(max_dim=1)
 # [(0, (0.0, inf)), (1, (0.3, 0.7)), ...]
 ```
 
+### Simplex pairs
+
+```python
+from flash_ph import rips_persistence_pairs, rips_apparent_pairs
+
+h0, h1 = rips_persistence_pairs(pts, max_edge_length=thresh)
+apparent_h0, apparent_h1 = rips_apparent_pairs(pts, max_edge_length=thresh)
+birth_edges = h1.birth_vertices
+death_triangles = h1.death_vertices
+```
+
+Each dimension returns a `SimplexPairs` table. For `P` pairs in dimension `d`,
+the birth and death tensors have shapes `(P, d+1)` and `(P, d+2)`. They
+contain ascending zero-based input vertex indices, use `torch.int32`, and
+live on the same device as the point tensor. An all-`-1` death row marks
+a birth that survives the truncated filtration. Both queries include
+zero-length pairs and sort rows by birth rank.
+
+The native simplex order uses input order for vertices, the stable
+`(float32 squared distance, low 32 bits of colex)` sort for edges, and
+`(maximum edge rank, triangle colex)` for triangles. Pair identities can
+depend on how ties are resolved. An apparent pair consists of the latest
+facet of a simplex and its earliest cofacet in this order. The standalone
+query uses the edge and triangle enumeration and skips column reduction.
+
+Both queries use the native implementation on CPU or CUDA for
+`max_dim=0` or `max_dim=1`. The diagram API supports giotto-ph and H2.
+`RipsComplex.persistence_pairs()` and `RipsComplex.apparent_pairs()`
+compute their results on demand.
+
 ## Scope and Guarantees
 
 - **Exact** Vietoris-Rips persistent homology over Z/2Z.

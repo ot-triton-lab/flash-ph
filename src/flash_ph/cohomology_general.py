@@ -213,6 +213,7 @@ def _general_cohomology_reduce_v2(
     pre_pool_ptr, pre_num_piv,
     order,                  # (K,) int32 — np.argsort(col_ranks)[::-1]
     budget_s=0.0,           # time budget in seconds (0 = unlimited)
+    return_all_pairs=False,
 ):
     """Cohomology reduction v2: receives pre-populated state from GPU prepass.
 
@@ -227,6 +228,8 @@ def _general_cohomology_reduce_v2(
     If ``budget_s > 0``, the function checks ``time.perf_counter()`` every
     100 XOR iterations.  When the budget is exceeded, it returns early with
     ``pool_ptr = -1`` as a timeout sentinel.
+
+    ``return_all_pairs`` retains zero-length pairs and raises on capacity loss.
     """
     K = col_ranks.shape[0]
 
@@ -250,9 +253,10 @@ def _general_cohomology_reduce_v2(
     num_piv = pre_num_piv
     pool_cap = pool_data.shape[0]
 
-    # Working buffers
-    cur = np.empty(MAX_COL, dtype=np.int32)
-    tmp = np.empty(MAX_COL, dtype=np.int32)
+    # In all-pairs mode one extra slot detects a truncated XOR.
+    capacity = MAX_COL + int(return_all_pairs)
+    cur = np.empty(capacity, dtype=np.int32)
+    tmp = np.empty(capacity, dtype=np.int32)
 
     # Time budget tracking via objmode (Numba doesn't support time.* natively)
     has_budget = budget_s > 0.0
@@ -294,8 +298,10 @@ def _general_cohomology_reduce_v2(
                     pool_data[pool_ptr + i] = cofacet_ranks[c_start + i]
                 pool_ptr += cn
                 num_piv += 1
+            elif return_all_pairs:
+                raise MemoryError("Native reduction pivot pool exhausted")
 
-            if rank_to_filt[youngest_cof] > rank_to_filt[r_e]:
+            if return_all_pairs or rank_to_filt[youngest_cof] > rank_to_filt[r_e]:
                 pair_births[n_pairs] = r_e
                 pair_deaths[n_pairs] = youngest_cof
                 n_pairs += 1
@@ -303,6 +309,8 @@ def _general_cohomology_reduce_v2(
 
         # Copy cofacet ranks into working buffer
         if cn > MAX_COL:
+            if return_all_pairs:
+                raise MemoryError("Native reduction column capacity exceeded")
             cn = MAX_COL
         for i in range(cn):
             cur[i] = cofacet_ranks[c_start + i]
@@ -323,6 +331,8 @@ def _general_cohomology_reduce_v2(
                 pool_data[ps:ps + plen], plen,
                 tmp,
             )
+            if return_all_pairs and cn > MAX_COL:
+                raise MemoryError("Native reduction column capacity exceeded")
             for i in range(cn):
                 cur[i] = tmp[i]
 
@@ -356,8 +366,10 @@ def _general_cohomology_reduce_v2(
                     pool_data[pool_ptr + i] = cur[i]
                 pool_ptr += cn
                 num_piv += 1
+            elif return_all_pairs:
+                raise MemoryError("Native reduction pivot pool exhausted")
 
-            if rank_to_filt[piv_rank] > rank_to_filt[r_e]:
+            if return_all_pairs or rank_to_filt[piv_rank] > rank_to_filt[r_e]:
                 pair_births[n_pairs] = r_e
                 pair_deaths[n_pairs] = piv_rank
                 n_pairs += 1

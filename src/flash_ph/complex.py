@@ -4,7 +4,9 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from flash_ph.persistence import rips_persistence
+from flash_ph.persistence import (
+    SimplexPairs, rips_apparent_pairs, rips_persistence, rips_persistence_pairs,
+)
 
 
 class RipsComplex:
@@ -81,6 +83,14 @@ class RipsComplex:
                 result.append((dim, (float(arr[i, 0]), float(arr[i, 1]))))
         result.sort(key=lambda x: (x[0], x[1][0], x[1][1]))
         return result
+
+    def persistence_pairs(self, max_dim: int = 1) -> list[SimplexPairs]:
+        """Compute simplex pairs for H0 or H0 and H1 with the native backend."""
+        return rips_persistence_pairs(self._points, self._max_edge_length, max_dim)
+
+    def apparent_pairs(self, max_dim: int = 1) -> list[SimplexPairs]:
+        """Find apparent simplex pairs directly from the filtration."""
+        return rips_apparent_pairs(self._points, self._max_edge_length, max_dim)
 
     def persistence_intervals_in_dimension(self, dim: int):
         """Return persistence intervals for a single dimension.

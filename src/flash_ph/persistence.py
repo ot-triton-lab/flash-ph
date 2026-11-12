@@ -9,15 +9,34 @@ Pipeline:
 """
 from __future__ import annotations
 
+from typing import NamedTuple
 
 import numpy as np
 import torch
 from torch import Tensor
 
-from flash_ph.rips import rips_filtration
+from flash_ph.rips import RipsFiltration, rips_filtration
 from flash_ph.boruvka import gpu_boruvka_mst
 
 _VERTEX_PACK_BITS = 16
+
+
+class SimplexPairs(NamedTuple):
+    """Paired simplex vertices in one homology dimension.
+
+    For dimension d and P pairs, birth_vertices and death_vertices have
+    shapes (P, d + 1) and (P, d + 2). Both are int32 tensors on the point
+    tensor's device. Vertices are ascending, zero-based input row indices.
+    A death row filled with -1 represents an essential birth.
+    """
+
+    birth_vertices: Tensor
+    death_vertices: Tensor
+
+
+def _edge_vertices(filt: RipsFiltration, ranks: Tensor) -> Tensor:
+    ranks = ranks.long()
+    return torch.stack((filt.edge_i[ranks], filt.edge_j[ranks]), dim=1)
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +84,30 @@ def _rips_h1h2_giotto(filt, n, max_dim, max_edge_length, device):
 # Public API
 # ---------------------------------------------------------------------------
 
+def _prepare_rips_points(points, max_edge_length, max_dim):
+    if isinstance(points, np.ndarray):
+        points = torch.from_numpy(points).float()
+        if torch.cuda.is_available():
+            points = points.cuda()
+
+    if max_edge_length < 0:
+        raise ValueError(
+            f"max_edge_length must be non-negative, got {max_edge_length}"
+        )
+    if points.ndim != 2:
+        raise ValueError(
+            f"points must have shape (n, d), got {tuple(points.shape)}"
+        )
+    if max_dim not in (0, 1, 2):
+        raise ValueError(f"max_dim must be 0, 1, or 2, got {max_dim}")
+    if max_dim == 2 and points.shape[0] >= (1 << _VERTEX_PACK_BITS):
+        raise ValueError(
+            f"H2 requires n < {1 << _VERTEX_PACK_BITS} (16-bit vertex packing), "
+            f"got n={points.shape[0]}. Use max_dim=1 or reduce n."
+        )
+    return points
+
+
 def rips_persistence(
     points,
     max_edge_length: float,
@@ -106,28 +149,7 @@ def rips_persistence(
     - Filtration: strict ``< max_edge_length``
     - Output: ``(birth, death)`` float32, ``inf`` for essential features
     """
-    # Accept numpy input
-    if isinstance(points, np.ndarray):
-        points = torch.from_numpy(points).float()
-        if torch.cuda.is_available():
-            points = points.cuda()
-
-    if max_edge_length < 0:
-        raise ValueError(
-            f"max_edge_length must be non-negative, got {max_edge_length}"
-        )
-    if points.ndim != 2:
-        raise ValueError(
-            f"points must have shape (n, d), got {tuple(points.shape)}"
-        )
-    if max_dim not in (0, 1, 2):
-        raise ValueError(f"max_dim must be 0, 1, or 2, got {max_dim}")
-    if max_dim == 2 and points.shape[0] >= (1 << _VERTEX_PACK_BITS):
-        raise ValueError(
-            f"H2 requires n < {1 << _VERTEX_PACK_BITS} (16-bit vertex packing), "
-            f"got n={points.shape[0]}. Use max_dim=1 or reduce n."
-        )
-
+    points = _prepare_rips_points(points, max_edge_length, max_dim)
     device = points.device
     n = points.shape[0]
 
@@ -203,4 +225,76 @@ def rips_persistence(
         if diag.numel() > 0:
             diag = diag[diag[:, 0].argsort(stable=True)]
         result.append(diag)
+    return result
+
+
+def _pair_filtration(points, max_edge_length, max_dim) -> RipsFiltration:
+    if max_dim == 2:
+        raise NotImplementedError("Simplex pairs are available for H0 and H1")
+    points = _prepare_rips_points(points, max_edge_length, max_dim)
+    return rips_filtration(points, max_edge_length)
+
+
+def rips_persistence_pairs(
+    points, max_edge_length: float, max_dim: int = 1,
+) -> list[SimplexPairs]:
+    """Return simplex pairs by dimension, including zero-length pairs.
+
+    Uses the native reduction on CPU or CUDA for max_dim 0 or 1. Rows
+    are ordered by birth rank within the dimension. Vertices have input
+    row order. Edges use the filtration's stable (squared distance,
+    low 32 bits of colex) sort. Triangles use (max edge rank, colex).
+    See SimplexPairs for the essential-birth convention.
+    """
+    filt = _pair_filtration(points, max_edge_length, max_dim)
+    device = filt.edge_i.device
+    mst_idx = gpu_boruvka_mst(
+        filt.edge_i, filt.edge_j,
+        torch.arange(filt.edge_i.numel(), dtype=torch.int32, device=device), filt.n,
+    )[0]
+
+    from flash_ph._numba_utils import _mst_persistence_deaths
+
+    mst_edges = _edge_vertices(filt, mst_idx.sort().values).cpu().numpy()
+    deaths = _mst_persistence_deaths(mst_edges, filt.n)
+    births = torch.arange(filt.n, dtype=torch.int32, device=device)
+    result = [SimplexPairs(births[:, None], torch.from_numpy(deaths).to(device))]
+    if max_dim == 1:
+        from flash_ph.reduce_h1_gpu import rips_h1_gpu_native
+
+        result.append(rips_h1_gpu_native(
+            filt, filt.n, mst_idx, max_edge_length, device,
+            backend="gpu", return_all_pairs=True,
+        ))
+    return result
+
+
+def rips_apparent_pairs(
+    points, max_edge_length: float, max_dim: int = 1,
+) -> list[SimplexPairs]:
+    """Return mutual latest-facet/earliest-cofacet pairs in native order.
+
+    Uses the same output and ordering as rips_persistence_pairs. Includes
+    zero-length apparent pairs. Works from the filtration and skips
+    the spanning forest and column reduction.
+    """
+    filt = _pair_filtration(points, max_edge_length, max_dim)
+    device = filt.edge_i.device
+    E = filt.edge_i.numel()
+    edge_ranks = torch.arange(E, dtype=torch.int32, device=device)
+    first_edge = torch.full((filt.n,), E, dtype=torch.int32, device=device)
+    for endpoint in (filt.edge_i, filt.edge_j):
+        first_edge.scatter_reduce_(0, endpoint.long(), edge_ranks, reduce="amin")
+
+    vertices = (first_edge < E).nonzero(as_tuple=True)[0]
+    ranks = first_edge[vertices].long()
+    apparent = filt.edge_j[ranks] == vertices
+    result = [SimplexPairs(
+        vertices[apparent].to(torch.int32)[:, None],
+        _edge_vertices(filt, ranks[apparent]),
+    )]
+    if max_dim == 1:
+        from flash_ph.reduce_h1_gpu import _h1_apparent_pairs
+
+        result.append(_h1_apparent_pairs(filt))
     return result

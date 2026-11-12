@@ -34,6 +34,8 @@ import torch
 from torch import Tensor
 
 from flash_ph.kernels.triangle_kernel import triangle_enumerate
+from flash_ph.persistence import SimplexPairs, _edge_vertices
+from flash_ph.rips import RipsFiltration
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +58,48 @@ _MIN_GIOTTO_EST_MS = 200.0
 # intra-column objmode budget check catches catastrophic columns
 # within the chunk.
 _CHUNK_SIZE = 100
+
+
+def _ranked_triangles(filt: RipsFiltration):
+    v0, v1, v2, max_ranks = triangle_enumerate(
+        filt.edge_i, filt.edge_j, filt.vert_adj_ptr, filt.vert_adj_idx,
+        filt.vert_adj_rank, filt.edge_i.numel(),
+    )
+    vertices = (v0, v1, v2)
+    a, b, c = (v.long() for v in vertices)
+    colex = c * (c - 1) * (c - 2) // 6 + b * (b - 1) // 2 + a
+    order = colex.argsort(stable=True)
+    order = order[max_ranks[order].argsort(stable=True)]
+    return vertices, max_ranks, order
+
+
+def _h1_apparent_pairs(filt: RipsFiltration) -> SimplexPairs:
+    triangles, max_ranks, order = _ranked_triangles(filt)
+    max_ranks = max_ranks[order]
+    # An edge's earliest cofacet is apparent iff its maximum face is that
+    # edge. Triangle order groups such cofacets by their maximum edge rank.
+    first = torch.ones_like(max_ranks, dtype=torch.bool)
+    first[1:] = max_ranks[1:] != max_ranks[:-1]
+    triangle_rows = order[first]
+    return SimplexPairs(
+        _edge_vertices(filt, max_ranks[first]),
+        torch.stack([v[triangle_rows] for v in triangles], dim=1),
+    )
+
+
+def _h1_simplex_pairs(
+    filt: RipsFiltration, triangles: tuple[Tensor, Tensor, Tensor],
+    birth_ranks: Tensor, triangle_rows: Tensor, essential_ranks: Tensor,
+) -> SimplexPairs:
+    ranks = torch.cat((birth_ranks, essential_ranks))
+    deaths = torch.full(
+        (ranks.numel(), 3), -1, dtype=torch.int32, device=ranks.device,
+    )
+    deaths[:triangle_rows.numel()] = torch.stack(
+        [v[triangle_rows] for v in triangles], dim=1,
+    )
+    order = ranks.argsort()
+    return SimplexPairs(_edge_vertices(filt, ranks[order]), deaths[order])
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +291,7 @@ def _prepare_numba_state(
     rank_to_filt: Tensor,
     cof_max_face: Tensor,
     is_apparent: Tensor,
+    return_all_pairs: bool = False,
 ):
     """Transfer GPU tensors to CPU and prepopulate Numba hash map + pool.
 
@@ -297,6 +342,8 @@ def _prepare_numba_state(
         hm_keys, hm_vals, hm_cap,
         pool_data, piv_start, piv_length, 0, 0,
     )
+    if return_all_pairs and num_piv != ap_indices_np.size:
+        raise MemoryError("Native reduction apparent-pair pivot pool exhausted")
 
     return (col_np, off_np, cof_np, skip_np, r2f_np, cmf_np,
             hm_keys, hm_vals, hm_cap,
@@ -413,6 +460,7 @@ def _reduce_full(
     col_np, off_np, cof_np, skip_np, r2f_np, cmf_np,
     hm_keys, hm_vals, hm_cap,
     pool_data, piv_start, piv_length, pool_ptr, num_piv,
+    return_all_pairs=False,
 ):
     """Run full Numba reduction without budget monitoring."""
     from flash_ph.cohomology_general import (
@@ -423,7 +471,7 @@ def _reduce_full(
         col_np, off_np, cof_np, skip_np, r2f_np, cmf_np,
         hm_keys, hm_vals, hm_cap,
         pool_data, piv_start, piv_length, pool_ptr, num_piv,
-        col_order,
+        col_order, return_all_pairs=return_all_pairs,
     )
     return (pb, pd, eb)
 
@@ -435,7 +483,10 @@ def _reduce_full(
 _VALID_BACKENDS = ('auto', 'gpu', 'giotto')
 
 
-def rips_h1_gpu_native(filt, n, mst_idx, max_edge_length, device, backend='auto'):
+def rips_h1_gpu_native(
+    filt, n, mst_idx, max_edge_length, device, backend='auto', *,
+    return_all_pairs=False,
+):
     """GPU-native H1 persistence for Rips complexes (with adaptive fallback).
 
     Uses cohomology reduction: columns = edges, cofacets = triangles.
@@ -454,15 +505,21 @@ def rips_h1_gpu_native(filt, n, mst_idx, max_edge_length, device, backend='auto'
         ``'auto'`` (default) — timed trial selects GPU-native or giotto-ph.
         ``'gpu'`` — always use GPU-native (Numba residual).
         ``'giotto'`` — always use giotto-ph C++ reduction.
+    return_all_pairs : bool
+        Return SimplexPairs including zero-length pairs. Requires the
+        native backend (``'gpu'``), including when run on CPU.
 
     Returns
     -------
-    h1_diagram : (K, 2) float32 — H1 persistence diagram
+    H1 persistence diagram, or SimplexPairs in all-pairs mode.
     """
     if backend not in _VALID_BACKENDS:
         raise ValueError(
             f"backend must be one of {_VALID_BACKENDS}, got {backend!r}"
         )
+
+    if return_all_pairs and backend != 'gpu':
+        raise ValueError("Simplex pairs require the native backend ('gpu')")
 
     # Early exit: always use giotto-ph if requested
     if backend == 'giotto':
@@ -471,9 +528,6 @@ def rips_h1_gpu_native(filt, n, mst_idx, max_edge_length, device, backend='auto'
     E = filt.edge_i.shape[0]
     edge_i = filt.edge_i
     edge_j = filt.edge_j
-    adj_ptr = filt.vert_adj_ptr
-    adj_idx = filt.vert_adj_idx
-    adj_rank = filt.vert_adj_rank
 
     # Edge filtration values
     edge_filt = torch.sqrt(filt.edge_dist_sq)
@@ -483,17 +537,17 @@ def rips_h1_gpu_native(filt, n, mst_idx, max_edge_length, device, backend='auto'
     if mst_idx.numel() > 0:
         mst_mask[mst_idx] = True
 
-    # Non-MST edge ranks (for T=0 edge case)
-    nonmst_ranks = (~mst_mask).nonzero(as_tuple=True)[0].to(torch.int32)
-
-    # --- Step 1: Enumerate triangles (GPU Triton kernel) ---
-    tri_v0, tri_v1, tri_v2, tri_max_rank = triangle_enumerate(
-        edge_i, edge_j, adj_ptr, adj_idx, adj_rank, E,
-    )
-    T = tri_v0.shape[0]
+    # --- Steps 1–3: Enumerate and rank triangles, then look up facets ---
+    triangles, tri_max_rank, tri_sort_perm = _ranked_triangles(filt)
+    T = tri_max_rank.numel()
 
     if T == 0:
         # No triangles → all non-MST edges are essential H1
+        nonmst_ranks = (~mst_mask).nonzero(as_tuple=True)[0].to(torch.int32)
+        if return_all_pairs:
+            return _h1_simplex_pairs(
+                filt, triangles, nonmst_ranks[:0], tri_sort_perm, nonmst_ranks,
+            )
         if nonmst_ranks.numel() == 0:
             return torch.empty(0, 2, dtype=torch.float32, device=device)
         births = edge_filt[nonmst_ranks.long()]
@@ -501,19 +555,11 @@ def rips_h1_gpu_native(filt, n, mst_idx, max_edge_length, device, backend='auto'
         h1 = torch.stack([births, deaths], dim=1)
         return h1[births.argsort(stable=True)]
 
-    # --- Step 2: Face rank lookup (GPU searchsorted) ---
+    if return_all_pairs and max(E + T, 3 * T) > torch.iinfo(torch.int32).max:
+        raise OverflowError("Native H1 triangle ranks or cofacet offsets exceed int32")
     face_ranks = _lookup_face_ranks_gpu(
-        tri_v0, tri_v1, tri_v2, edge_i, edge_j, n,
+        *triangles, edge_i, edge_j, n,
     )
-
-    # --- Step 3: Sort triangles, assign global ranks ---
-    v0, v1, v2 = tri_v0.long(), tri_v1.long(), tri_v2.long()
-    tri_colex = v2 * (v2 - 1) * (v2 - 2) // 6 + v1 * (v1 - 1) // 2 + v0
-
-    tri_sort_perm = tri_colex.argsort(stable=True)
-    tri_sort_perm = tri_sort_perm[
-        tri_max_rank[tri_sort_perm].long().argsort(stable=True)
-    ]
 
     tri_global_rank = torch.empty(T, dtype=torch.int32, device=device)
     tri_global_rank[tri_sort_perm] = (
@@ -541,12 +587,13 @@ def rips_h1_gpu_native(filt, n, mst_idx, max_edge_length, device, backend='auto'
             skip_mask, rank_to_filt, total,
         )
     )
-    residual_count = int((~is_apparent & ~skip_mask).sum().item())
+    if return_all_pairs:
+        ap_births, ap_deaths = col_ranks[is_apparent], ap_pivots
 
     # --- Step 8: Prepare Numba state (CPU transfer + pool prepopulation) ---
     numba_state = _prepare_numba_state(
         col_ranks, cofacet_offsets, cofacet_ranks,
-        skip_mask, rank_to_filt, cof_max_face, is_apparent,
+        skip_mask, rank_to_filt, cof_max_face, is_apparent, return_all_pairs,
     )
     (col_np, off_np, cof_np, skip_np, r2f_np, cmf_np,
      hm_keys, hm_vals, hm_cap,
@@ -554,6 +601,7 @@ def rips_h1_gpu_native(filt, n, mst_idx, max_edge_length, device, backend='auto'
 
     # --- Step 9+10: Numba residual reduction (with budget monitoring) ---
     if backend == 'auto':
+        residual_count = int((~is_apparent & ~skip_mask).sum().item())
         result = _reduce_chunked_with_budget(
             residual_count, E,
             col_np, off_np, cof_np, skip_np, r2f_np, cmf_np,
@@ -568,19 +616,20 @@ def rips_h1_gpu_native(filt, n, mst_idx, max_edge_length, device, backend='auto'
             col_np, off_np, cof_np, skip_np, r2f_np, cmf_np,
             hm_keys, hm_vals, hm_cap,
             pool_data, piv_start, piv_length, pool_ptr, num_piv,
+            return_all_pairs=return_all_pairs,
         )
         numba_pb, numba_pd, numba_eb = result
 
     # --- Step 11: Merge GPU apparent pairs + Numba results ---
-    all_pb = torch.cat([ap_births.cpu().to(torch.int32),
-                        torch.from_numpy(numba_pb.copy())])
-    all_pd = torch.cat([ap_deaths.cpu().to(torch.int32),
-                        torch.from_numpy(numba_pd.copy())])
-    all_eb = torch.from_numpy(numba_eb.copy())
+    pair_births = torch.cat((ap_births, torch.from_numpy(numba_pb).to(device)))
+    pair_deaths = torch.cat((ap_deaths, torch.from_numpy(numba_pd).to(device)))
+    ess_births = torch.from_numpy(numba_eb).to(device)
 
-    pair_births = all_pb.to(device)
-    pair_deaths = all_pd.to(device)
-    ess_births = all_eb.to(device)
+    if return_all_pairs:
+        triangle_rows = tri_sort_perm[pair_deaths.long() - E]
+        return _h1_simplex_pairs(
+            filt, triangles, pair_births, triangle_rows, ess_births,
+        )
 
     # --- Step 12: Convert global ranks → filtration values → H1 diagram ---
     parts = []
